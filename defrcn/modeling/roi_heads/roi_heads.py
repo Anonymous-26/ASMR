@@ -557,7 +557,6 @@ from .attr_modules import (
     AttributePrototypeBank,
 )
 from .attr_fusion import AttributeFusion
-from .attr_ppr import PPRAttributeInference
 from .attr_prob_class import AttributeProbClassInference
 from .attr_monitor import AttributeMonitor
 from .bg_filter_monitor import (
@@ -760,28 +759,6 @@ class CommonalityROIHeads(ROIHeads):
             self.attr_cluster_projector = None
             self.attr_cluster_proj_norm = True
 
-        self.attr_ppr_cfg = getattr(self.attr_cfg, "PPR", None)
-        self.attr_ppr_enabled = bool(self.attr_ppr_cfg and self.attr_ppr_cfg.ENABLED)
-        if self.attr_ppr_enabled:
-            self.attr_ppr = PPRAttributeInference(
-                alpha=self.attr_ppr_cfg.ALPHA,
-                max_iter=self.attr_ppr_cfg.MAX_ITER,
-                tol=self.attr_ppr_cfg.TOL,
-                eps=self.attr_ppr_cfg.EPS,
-                unique_edge_boost=self.attr_ppr_cfg.UNIQUE_EDGE_BOOST,
-                shared_penalty_gamma=self.attr_ppr_cfg.SHARED_PENALTY_GAMMA,
-            )
-            self.attr_ppr_eps = float(self.attr_ppr_cfg.EPS)
-            self.attr_ppr_use_unique = bool(self.attr_ppr_cfg.USE_UNIQUE_MASK)
-            self.attr_ppr_loss_weight = float(
-                getattr(self.attr_ppr_cfg, "LOSS_WEIGHT", 0.0)
-            )
-        else:
-            self.attr_ppr = None
-            self.attr_ppr_eps = 1e-12
-            self.attr_ppr_use_unique = False
-            self.attr_ppr_loss_weight = 0.0
-
         self.attr_prob_class_cfg = getattr(self.attr_cfg, "PROB_CLASS", None)
         self.attr_prob_class_enabled = bool(
             self.attr_prob_class_cfg and self.attr_prob_class_cfg.ENABLED
@@ -796,10 +773,6 @@ class CommonalityROIHeads(ROIHeads):
         else:
             self.attr_prob_class = None
             self.attr_prob_class_eps = 1e-12
-        if self.attr_prob_class_enabled and self.attr_ppr_enabled:
-            logger.warning(
-                "Both PROB_CLASS and PPR are enabled; PROB_CLASS will take precedence in inference."
-            )
         self.register_buffer(
             "attr_class_prototypes",
             torch.zeros(self.num_classes + 1, self.attr_cfg.EMBEDDING_DIM),
@@ -811,7 +784,6 @@ class CommonalityROIHeads(ROIHeads):
                 num_classes=self.num_classes,
                 base_indices=self.base_index,
                 novel_indices=self.novel_index,
-                ppr_module=self.attr_ppr if self.attr_ppr_enabled else None,
             )
             self.attr_fusion_use_bg = bool(getattr(fusion_cfg, "USE_BG_CONSTRAINT", True))
             self.attr_fusion_bg_thresh = float(getattr(fusion_cfg, "BG_THRESHOLD", 0.5))
@@ -879,8 +851,6 @@ class CommonalityROIHeads(ROIHeads):
             params += list(self.attr_bilinear.parameters())
         if self.attr_cluster_projector is not None:
             params += list(self.attr_cluster_projector.parameters())
-        if self.attr_ppr is not None:
-            params += list(self.attr_ppr.parameters())
         return [p for p in params if p.requires_grad]
 
     def _cache_bg_filter_context(

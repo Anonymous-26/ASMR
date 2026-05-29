@@ -19,7 +19,6 @@ class AttributeFusion(nn.Module):
         num_classes: int,
         base_indices: Sequence[int],
         novel_indices: Sequence[int],
-        ppr_module: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
         fusion_cfg = cfg.MODEL.ATTRIBUTE.FUSION
@@ -43,7 +42,6 @@ class AttributeFusion(nn.Module):
         self.su_novel_unique = float(fusion_cfg.SU_NOVEL_UNIQUE)
         self.eps = float(fusion_cfg.EPS)
         self.mode = str(getattr(fusion_cfg, "MODE", "poe"))
-        self.ppr = ppr_module
 
     @staticmethod
     def _align_mask_columns(mask: torch.Tensor, target_cols: int) -> torch.Tensor:
@@ -111,12 +109,9 @@ class AttributeFusion(nn.Module):
         H = incidence
         if self.use_su:
             H = self._su_weight_matrix(incidence, shared_mask, unique_mask)
-        if self.cluster_map == "ppr" and self.ppr is not None:
-            probs = self.ppr(cluster_probs, H)
-        else:
-            probs = cluster_probs @ H
-            row_sum = probs.sum(dim=1, keepdim=True).clamp(min=self.eps)
-            probs = probs / row_sum
+        probs = cluster_probs @ H
+        row_sum = probs.sum(dim=1, keepdim=True).clamp(min=self.eps)
+        probs = probs / row_sum
         if not keep_background and probs.shape[1] > self.num_classes:
             probs = probs[:, : self.num_classes]
         return probs

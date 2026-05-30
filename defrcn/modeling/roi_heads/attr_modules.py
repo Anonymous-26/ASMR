@@ -12,19 +12,17 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
+from defrcn.modeling.meta_arch.gdl import decouple_layer
 
-
-DEFAULT_SUPER_ATTR = Path(
-    "datasets/llm_embeding/output/super_attributes/voc_attr_split1_super_attributes_k40.npz"
-)
 
 class AttributeEmbeddingHead(nn.Module):
     """
     属性预测头（M2）：将 ROI 特征投射到属性 embedding 空间。
     """
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, pooled: bool, attr_with_center_norm) -> None:
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, pooled: bool, attr_with_center_norm, attr_backward_scale) -> None:
         super().__init__()
         self.pooled = pooled
+        self.attr_backward_scale = attr_backward_scale
         self.attr_with_center_norm = attr_with_center_norm
         if pooled:
             self.net = nn.Sequential(
@@ -52,7 +50,9 @@ class AttributeEmbeddingHead(nn.Module):
         """
         前向计算：先扁平化，再过 MLP，并进行 L2 归一化。
         """
+        features = decouple_layer(features, self.attr_backward_scale)
         if self.pooled:
+            features = features.mean(dim=[2, 3]) 
             if features.dim() > 2:
                 features = torch.flatten(features, start_dim=1)
             embeddings = self.net(features)
@@ -306,9 +306,7 @@ class AttributePrototypeBank:
         class_names: Optional[List[str]],
         background_name: str,
     ) -> None:
-        path = Path(super_attr_path) if super_attr_path else DEFAULT_SUPER_ATTR
-        if path.is_dir():
-            path = path / DEFAULT_SUPER_ATTR.name
+        path = Path(super_attr_path)
         self.super_attr_path = path
         self.class_names_override = list(class_names) if class_names else None
         self.background_name = background_name

@@ -23,7 +23,7 @@ class EvalResultsExporter(DatasetEvaluator):
         self._eval_results_path = str(cfg.MODEL.ATTRIBUTE.EVAL_RESULTS_PATH)
         self._num_classes = int(cfg.MODEL.ROI_HEADS.NUM_CLASSES)
         self._attr_enabled = bool(cfg.MODEL.ATTRIBUTE.ENABLED)
-        self._eval_use_gt = bool(cfg.MODEL.ATTRIBUTE.EVAL_USE_GT_BOXES)
+        self._eval_use_gt = bool(cfg.MODEL.EVAL_USE_GT_BOXES)
         self._class_names = None
         try:
             meta = MetadataCatalog.get(dataset_name)

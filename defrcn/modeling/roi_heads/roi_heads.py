@@ -630,7 +630,7 @@ class CommonalityROIHeads(ROIHeads):
                 if i not in self.novel_index:
                     self.base_index.append(i)
 
-        self.attribute_branch = AMBR(cfg, self.novel_index, self.num_classes, out_channels)
+        self.attribute_branch = AMBR(cfg, self.novel_index, self.base_index, self.num_classes, out_channels)
         self.use_gt_bbox = cfg.MODEL.EVAL_USE_GT_BOXES
 
 
@@ -969,9 +969,7 @@ class CommonalityROIHeads(ROIHeads):
             losses = outputs.losses()
 
             storage = get_event_storage()
-            if self.attribute_branch and not self.attribute_branch._attribute_warmup_active(self.training, storage):
-                attr_losses, attr_targets = self.attribute_branch._attribute_forward(box_features, outputs)
-                
+
             if int(storage.iter) >= self.warmup_distill:
 
                 if self.semantic:
@@ -1004,7 +1002,8 @@ class CommonalityROIHeads(ROIHeads):
                         )
                     losses.update({"loss_cls_score_aug": loss_cls_score_aug * 0.1})
                     
-            if self.attribute_branch:
+            if self.attribute_branch and not self.attribute_branch._attribute_warmup_active(self.training, storage):
+                attr_losses, attr_targets = self.attribute_branch._attribute_forward(box_features, outputs)
                 losses.update(attr_losses)
                 
             return [], losses

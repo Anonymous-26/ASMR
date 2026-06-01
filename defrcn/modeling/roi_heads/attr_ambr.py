@@ -58,7 +58,8 @@ from .bg_filter_monitor import (
 
 class AMBR(nn.Module):
     
-    def __init__(self, cfg, novel_index, num_classes, feature_dim):
+    def __init__(self, cfg, novel_index, base_index, num_classes, feature_dim):
+        super().__init__()
         self.attr_cfg = cfg.MODEL.ATTRIBUTE.clone()
         self.attr_enabled = self.attr_cfg.ENABLED
         self.attr_loss_weight = self.attr_cfg.LOSS_WEIGHT
@@ -72,6 +73,7 @@ class AMBR(nn.Module):
         self.attr_warmup_iters = self.attr_cfg.WARMUP_ITERS
         self.attr_monitor: Optional[AttributeMonitor] = None
         self.novel_class_indices = list(novel_index)
+        self.base_index = base_index
         self.num_classes = num_classes
         self.attr_prototypes_ready = False
         self.latest_attribute_state = {}

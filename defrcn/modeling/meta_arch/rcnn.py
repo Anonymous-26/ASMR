@@ -61,7 +61,7 @@ class GeneralizedRCNN(nn.Module):
         if hasattr(self.roi_heads, "latest_eval_export_context"):
             self.roi_heads.latest_eval_export_context = {}
         gt_instances = None
-        if self.cfg.MODEL.ATTRIBUTE.EVAL_USE_GT_BOXES:
+        if self.cfg.MODEL.EVAL_USE_GT_BOXES:
             if "instances" in batched_inputs[0]:
                 gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
             else:

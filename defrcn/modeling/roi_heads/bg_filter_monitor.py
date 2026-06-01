@@ -22,10 +22,12 @@ def build_background_filter_payload(
     pseudo_mask: torch.Tensor,
     proposal_boxes: Optional[torch.Tensor],
     gt_boxes: Optional[Sequence[Optional[torch.Tensor]]],
+    gt_classes: Optional[Sequence[Optional[torch.Tensor]]],
     num_preds_per_image: Sequence[int],
     bg_class_index: int,
     background_class_name: str,
     class_names: Sequence[str],
+    match_iou: float = 0.5,
     file_names: Optional[Sequence[str]] = None,
 ) -> Dict[str, object]:
     total_rois = int(gt_classes_before.numel())
@@ -83,6 +85,14 @@ def build_background_filter_payload(
     margin_cpu = margin.detach().cpu()
     novel_indices_cpu = novel_indices.detach().cpu()
     boxes_cpu = proposal_boxes.detach().cpu()
+    gt_boxes_cpu = [
+        boxes.detach().cpu() if boxes is not None else None
+        for boxes in (gt_boxes or [])
+    ]
+    gt_classes_cpu = [
+        classes.detach().cpu() if classes is not None else None
+        for classes in (gt_classes or [])
+    ]
 
     records_by_image: Dict[int, List[Dict[str, object]]] = {}
     for local_idx, global_idx_t in enumerate(bg_indices_cpu):
@@ -104,6 +114,33 @@ def build_background_filter_payload(
             action = "keep_bg"
 
         top1_class = int(novel_indices_cpu[int(max_idx_cpu[local_idx].item())].item())
+        matched_gt_iou = 0.0
+        matched_gt_class = -1
+        if image_index < len(gt_boxes_cpu) and gt_boxes_cpu[image_index] is not None:
+            image_gt_boxes = gt_boxes_cpu[image_index]
+            if image_gt_boxes.numel() > 0:
+                roi_box = boxes_cpu[global_idx]
+                top_left = torch.maximum(roi_box[:2], image_gt_boxes[:, :2])
+                bottom_right = torch.minimum(roi_box[2:], image_gt_boxes[:, 2:])
+                intersection = (bottom_right - top_left).clamp(min=0).prod(dim=1)
+                roi_area = (roi_box[2:] - roi_box[:2]).clamp(min=0).prod()
+                gt_areas = (image_gt_boxes[:, 2:] - image_gt_boxes[:, :2]).clamp(
+                    min=0
+                ).prod(dim=1)
+                ious = intersection / (roi_area + gt_areas - intersection).clamp(
+                    min=1e-12
+                )
+                matched_gt_iou, matched_gt_idx = ious.max(dim=0)
+                matched_gt_iou = float(matched_gt_iou.item())
+                if (
+                    image_index < len(gt_classes_cpu)
+                    and gt_classes_cpu[image_index] is not None
+                    and int(matched_gt_idx.item()) < gt_classes_cpu[image_index].numel()
+                ):
+                    matched_gt_class = int(
+                        gt_classes_cpu[image_index][int(matched_gt_idx.item())].item()
+                    )
+        matched_known_fg = matched_gt_iou >= float(match_iou)
         record = {
             "image_index": image_index,
             "roi_index_in_image": roi_index_in_image,
@@ -117,6 +154,14 @@ def build_background_filter_payload(
             "margin": float(margin_cpu[local_idx].item()),
             "passed_bg_threshold": bool(suppress_mask_cpu[local_idx].item()),
             "passed_pseudo_threshold": bool(pseudo_mask_cpu[local_idx].item()),
+            "matched_known_gt_iou": matched_gt_iou,
+            "matched_known_gt_class_name": decode_label(matched_gt_class),
+            "matched_known_fg": matched_known_fg,
+            "pseudo_known_gt_class_correct": (
+                action == "pseudo_to_novel"
+                and matched_known_fg
+                and top1_class == matched_gt_class
+            ),
         }
         records_by_image.setdefault(image_index, []).append(record)
 
@@ -145,7 +190,45 @@ def build_background_filter_payload(
             }
         )
 
+    stats.update(_summarize_known_gt_accuracy(per_image))
     return {"stats": stats, "per_image": per_image}
+
+
+def _summarize_known_gt_accuracy(
+    per_image: Sequence[Dict[str, object]],
+) -> Dict[str, object]:
+    records = [
+        record
+        for entry in per_image
+        for record in entry.get("records", [])
+    ]
+    ignored = [
+        record for record in records if record.get("action") == "suppress_to_ignore"
+    ]
+    pseudo = [
+        record for record in records if record.get("action") == "pseudo_to_novel"
+    ]
+    changed = ignored + pseudo
+    ignored_correct = sum(bool(record.get("matched_known_fg", False)) for record in ignored)
+    pseudo_fg_correct = sum(bool(record.get("matched_known_fg", False)) for record in pseudo)
+    pseudo_class_correct = sum(
+        bool(record.get("pseudo_known_gt_class_correct", False)) for record in pseudo
+    )
+    changed_correct = ignored_correct + pseudo_class_correct
+    return {
+        "num_changed": len(changed),
+        "num_changed_correct_known_gt": changed_correct,
+        "num_ignored_correct_known_gt": ignored_correct,
+        "num_pseudo_fg_correct_known_gt": pseudo_fg_correct,
+        "num_pseudo_class_correct_known_gt": pseudo_class_correct,
+        "ratio_changed_accuracy_known_gt": float(changed_correct) / float(max(len(changed), 1)),
+        "ratio_ignored_accuracy_known_gt": float(ignored_correct) / float(max(len(ignored), 1)),
+        "ratio_pseudo_fg_precision_known_gt": float(pseudo_fg_correct) / float(max(len(pseudo), 1)),
+        "ratio_pseudo_class_accuracy_known_gt": float(pseudo_class_correct) / float(max(len(pseudo), 1)),
+        "ratio_pseudo_class_accuracy_over_matched_known_gt": (
+            float(pseudo_class_correct) / float(max(pseudo_fg_correct, 1))
+        ),
+    }
 
 
 def filter_background_filter_payload(
@@ -196,6 +279,7 @@ def filter_background_filter_payload(
         "ratio_ignored_over_bg": float(num_ignored) / float(denom_bg),
         "ratio_pseudo_over_bg": float(num_pseudo) / float(denom_bg),
     }
+    stats.update(_summarize_known_gt_accuracy(per_image))
     return {"stats": stats, "per_image": per_image}
 
 
@@ -378,16 +462,18 @@ class BackgroundFilterTensorboardLogger:
         payload: Optional[Dict[str, object]],
         images_tensor: Optional[torch.Tensor],
         image_sizes: Optional[Sequence[Sequence[int]]],
+        stats_payload: Optional[Dict[str, object]] = None,
     ) -> None:
-        if self.writer is None or step is None or not payload:
+        if self.writer is None or step is None:
             return
-        stats = payload.get("stats")
+        stats_source = stats_payload if stats_payload is not None else payload
+        stats = stats_source.get("stats") if stats_source else None
         if stats:
             for key, value in stats.items():
                 prefix = "bg_filter/count" if key.startswith("num_") else "bg_filter/ratio"
                 self.writer.add_scalar(f"{prefix}/{key}", float(value), step)
 
-        if images_tensor is None or image_sizes is None:
+        if not payload or images_tensor is None or image_sizes is None:
             return
 
         ranked = sorted(

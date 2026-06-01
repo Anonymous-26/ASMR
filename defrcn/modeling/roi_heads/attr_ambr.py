@@ -75,6 +75,7 @@ class AMBR(nn.Module):
         self.novel_class_indices = list(novel_index)
         self.base_index = base_index
         self.num_classes = num_classes
+        self.bg_class_index = num_classes
         self.attr_prototypes_ready = False
         self.latest_attribute_state = {}
         self.is_warmuped = False
@@ -196,8 +197,10 @@ class AMBR(nn.Module):
         self._bg_filter_last_step = -1
         self._bg_filter_context = None
         self.bg_filter_min_action_types = 2
+        self.bg_filter_match_iou = 0.5
         if bg_filter_monitor_cfg and bg_filter_monitor_cfg.ENABLED:
             self.bg_filter_min_action_types = bg_filter_monitor_cfg.MIN_ACTION_TYPES
+            self.bg_filter_match_iou = float(bg_filter_monitor_cfg.MATCH_IOU)
             check_every_iter = bg_filter_monitor_cfg.CHECK_EVERY_ITER 
             self.bg_filter_log_period = 1 if check_every_iter else int(bg_filter_monitor_cfg.LOG_PERIOD)
             writer = self.attr_monitor.writer if self.attr_monitor is not None else None
@@ -564,6 +567,12 @@ class AMBR(nn.Module):
                 else None
                 for inst in (targets or [])
             ],
+            "gt_classes": [
+                inst.gt_classes.detach()
+                if inst is not None and inst.has("gt_classes")
+                else None
+                for inst in (targets or [])
+            ],
             "num_preds_per_image": num_preds_per_image,
             "file_names": [
                 str(sample.get("file_name", ""))
@@ -633,23 +642,25 @@ class AMBR(nn.Module):
             pseudo_mask=pseudo_mask,
             proposal_boxes=context.get("proposal_boxes"),
             gt_boxes=context.get("gt_boxes"),
+            gt_classes=context.get("gt_classes"),
             num_preds_per_image=context.get("num_preds_per_image", []),
             bg_class_index=self.bg_class_index,
             background_class_name=str(
                 getattr(self.attr_cfg, "BACKGROUND_CLASS", "background")
             ),
             class_names=class_names,
+            match_iou=self.bg_filter_match_iou,
             file_names=context.get("file_names"),
         )
+        if not self._should_log_bg_filter(step):
+            return
+        stats_payload = payload
         selected_image_indices = self._get_mixed_action_bg_filter_indices(payload)
-        if not self._should_log_bg_filter(step, selected_image_indices):
-            return
         payload = filter_background_filter_payload(payload, selected_image_indices)
-        if not payload:
-            return
         self.bg_filter_monitor.log(
             step=step,
             payload=payload,
+            stats_payload=stats_payload,
             images_tensor=context.get("images_tensor"),
             image_sizes=context.get("image_sizes"),
         )

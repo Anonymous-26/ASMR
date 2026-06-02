@@ -71,6 +71,8 @@ class AMBR(nn.Module):
         self.pseudo_threshold = self.attr_cfg.PSEUDO_THRESHOLD
         self.bg_penalty_weight = self.attr_cfg.BG_SUPPRESSION_WEIGHT
         self.attr_warmup_iters = self.attr_cfg.WARMUP_ITERS
+        self.gate_cfg = self.attr_cfg.GATE
+        self.gate_enabled = bool(self.gate_cfg.ENABLED)
         self.attr_monitor: Optional[AttributeMonitor] = None
         self.novel_class_indices = list(novel_index)
         self.base_index = base_index
@@ -95,6 +97,13 @@ class AMBR(nn.Module):
             self.attr_with_center_norm,
             self.attr_backward_scale
         )
+        self.semantic_gate = None
+        if self.gate_enabled:
+            self.semantic_gate = nn.Sequential(
+                nn.Linear(feature_dim + 2, int(self.gate_cfg.HIDDEN_DIM)),
+                nn.ReLU(inplace=True),
+                nn.Linear(int(self.gate_cfg.HIDDEN_DIM), 1),
+            )
         class_names = (
             list(self.attr_cfg.CLASS_NAMES)
             if len(self.attr_cfg.CLASS_NAMES)
@@ -229,12 +238,14 @@ class AMBR(nn.Module):
             params += list(self.attr_bilinear.parameters())
         if self.attr_cluster_projector is not None:
             params += list(self.attr_cluster_projector.parameters())
+        if self.semantic_gate is not None:
+            params += list(self.semantic_gate.parameters())
         return [p for p in params if p.requires_grad]
     
-    def _attribute_forward(self, box_features: torch.Tensor, outputs: FastRCNNOutputs):
+    def _build_semantic_state(self, box_features: torch.Tensor):
         attr_embeddings = self.attribute_head(box_features)
         if self.prototype_bank is None:
-            return {}
+            return None
         cluster_state = self.prototype_bank.get_cluster_state(attr_embeddings.device)
         cluster_embeddings = cluster_state["embeddings"]
         incidence = cluster_state["incidence"]
@@ -259,14 +270,104 @@ class AMBR(nn.Module):
             attr_embeddings, cluster_embeddings, class_prototypes
         )
         self._update_prototype_cache(class_prototypes)
+        return attr_embeddings, cluster_embeddings, incidence, class_prototypes
+
+    def _compute_semantic_gate(
+        self,
+        box_features: torch.Tensor,
+        visual_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.semantic_gate is None:
+            return visual_logits.new_ones((visual_logits.shape[0],))
+        visual_probs = F.softmax(visual_logits, dim=-1)
+        foreground_probs = visual_probs[:, : self.num_classes]
+        normalized_entropy = -(
+            visual_probs * visual_probs.clamp(min=1e-8).log()
+        ).sum(dim=1, keepdim=True) / np.log(max(visual_probs.shape[1], 2))
+        topk = min(2, foreground_probs.shape[1])
+        top_probs = torch.topk(foreground_probs, k=topk, dim=1).values
+        visual_margin = top_probs[:, :1]
+        if topk > 1:
+            visual_margin = top_probs[:, :1] - top_probs[:, 1:2]
+        if bool(self.gate_cfg.DETACH_VISUAL_STATS):
+            normalized_entropy = normalized_entropy.detach()
+            visual_margin = visual_margin.detach()
+        pooled_features = box_features.mean(dim=[2, 3])
+        if bool(self.gate_cfg.DETACH_FEATURES):
+            pooled_features = pooled_features.detach()
+        gate_inputs = torch.cat(
+            [pooled_features, normalized_entropy, visual_margin], dim=1
+        )
+        gate_weights = torch.sigmoid(self.semantic_gate(gate_inputs)).squeeze(1)
+        self.latest_attribute_state = {
+            "gate_weights": gate_weights.detach(),
+            "visual_entropy": normalized_entropy.detach().squeeze(1),
+            "visual_margin": visual_margin.detach().squeeze(1),
+        }
+        return gate_weights
+
+    def _log_semantic_gate(
+        self,
+        gate_weights: torch.Tensor,
+        gt_classes: Optional[torch.Tensor] = None,
+    ) -> None:
+        if gate_weights.numel() == 0:
+            return
+        try:
+            storage = get_event_storage()
+        except Exception:
+            return
+        detached = gate_weights.detach()
+        storage.put_scalar("attr_gate/mean", float(detached.mean().item()))
+        storage.put_scalar("attr_gate/min", float(detached.min().item()))
+        storage.put_scalar("attr_gate/max", float(detached.max().item()))
+        visual_entropy = self.latest_attribute_state.get("visual_entropy")
+        visual_margin = self.latest_attribute_state.get("visual_margin")
+        if visual_entropy is not None:
+            storage.put_scalar(
+                "attr_gate/visual_entropy_mean",
+                float(visual_entropy.mean().item()),
+            )
+        if visual_margin is not None:
+            storage.put_scalar(
+                "attr_gate/visual_margin_mean",
+                float(visual_margin.mean().item()),
+            )
+        if gt_classes is not None:
+            fg_mask = (gt_classes >= 0) & (gt_classes < self.num_classes)
+            bg_mask = gt_classes == self.num_classes
+            if torch.any(fg_mask):
+                storage.put_scalar(
+                    "attr_gate/mean_fg", float(detached[fg_mask].mean().item())
+                )
+            if torch.any(bg_mask):
+                storage.put_scalar(
+                    "attr_gate/mean_bg", float(detached[bg_mask].mean().item())
+                )
+
+    def _attribute_forward(self, box_features: torch.Tensor, outputs: FastRCNNOutputs):
+        semantic_state = self._build_semantic_state(box_features)
+        if semantic_state is None:
+            return {}, outputs.gt_classes
+        attr_embeddings, cluster_embeddings, incidence, class_prototypes = semantic_state
+        gate_weights = self._compute_semantic_gate(
+            box_features, outputs.pred_class_logits
+        )
+        if self.semantic_gate is not None:
+            self._log_semantic_gate(gate_weights, outputs.gt_classes)
         attr_targets = outputs.gt_classes
         if attr_targets is not None:
             attr_targets = attr_targets.clone()
         penalty, attr_targets = self._apply_background_filtering(
             attr_embeddings, attr_targets, class_prototypes )
         losses = self._compute_attribute_losses(
-            attr_embeddings, attr_targets, class_prototypes
+            attr_embeddings, attr_targets, class_prototypes, gate_weights
         )
+        if self.semantic_gate is not None:
+            losses["loss_attr_gate"] = (
+                F.relu(float(self.gate_cfg.MIN_MEAN) - gate_weights.mean())
+                * float(self.gate_cfg.REG_WEIGHT)
+            )
 
         losses["loss_attr_bg"] = (
             penalty if penalty is not None else attr_embeddings.new_tensor(0.0)
@@ -276,12 +377,31 @@ class AMBR(nn.Module):
             attr_targets,
             cluster_embeddings,
             incidence,
+            gate_weights,
         )
         if cluster_loss is not None:
             losses["loss_attr_cluster"] = cluster_loss
         if self.attr_monitor is not None:
             self._log_attribute_monitor(class_prototypes)
         return losses, attr_targets
+
+    def semantic_fusion_probs(
+        self,
+        box_features: torch.Tensor,
+        visual_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        semantic_state = self._build_semantic_state(box_features)
+        visual_probs = F.softmax(visual_logits, dim=-1)
+        if semantic_state is None:
+            return visual_probs
+        attr_embeddings, _, _, class_prototypes = semantic_state
+        semantic_logits = torch.matmul(attr_embeddings, class_prototypes.t())
+        semantic_probs = F.softmax(semantic_logits / self.attr_temperature, dim=-1)
+        gate_weights = self._compute_semantic_gate(box_features, visual_logits)
+        return (
+            (1.0 - gate_weights[:, None]) * visual_probs
+            + gate_weights[:, None] * semantic_probs
+        )
 
     def _update_prototype_cache(self, class_prototypes: torch.Tensor):
         if not hasattr(self, "attr_class_prototypes"):
@@ -365,6 +485,7 @@ class AMBR(nn.Module):
         attr_embeddings: torch.Tensor,
         gt_classes: Optional[torch.Tensor],
         class_prototypes: torch.Tensor,
+        gate_weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         losses: Dict[str, torch.Tensor] = {}
         if gt_classes is None:
@@ -377,13 +498,24 @@ class AMBR(nn.Module):
             return losses
         preds = attr_embeddings[valid_mask]
         targets = class_prototypes[gt_classes[valid_mask]]
+        weights = (
+            gate_weights[valid_mask]
+            if gate_weights is not None
+            else preds.new_ones((preds.shape[0],))
+        )
         proto_loss = 1.0 - F.cosine_similarity(preds, targets, dim=-1)
-        losses["loss_attr_proto"] = proto_loss.mean() * self.attr_loss_weight
+        losses["loss_attr_proto"] = (
+            (proto_loss * weights).mean()
+        ) * self.attr_loss_weight
 
         if self.attr_contrastive_weight > 0:
             logits = torch.matmul(preds, class_prototypes.t()) / self.attr_temperature
-            contrastive = F.cross_entropy(logits, gt_classes[valid_mask], reduction="mean")
-            losses["loss_attr_con"] = contrastive * self.attr_contrastive_weight
+            contrastive = F.cross_entropy(
+                logits, gt_classes[valid_mask], reduction="none"
+            )
+            losses["loss_attr_con"] = (
+                (contrastive * weights).mean()
+            ) * self.attr_contrastive_weight
         return losses
 
     def _compute_cluster_incidence_loss(
@@ -392,6 +524,7 @@ class AMBR(nn.Module):
         gt_classes: Optional[torch.Tensor],
         cluster_embeddings: torch.Tensor,
         incidence: torch.Tensor,
+        gate_weights: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         if (
             attr_embeddings is None
@@ -422,12 +555,19 @@ class AMBR(nn.Module):
             return None
         pred = cluster_probs[keep]
         target = target[keep]
+        weights = (
+            gate_weights[valid_mask][keep]
+            if gate_weights is not None
+            else pred.new_ones((pred.shape[0],))
+        )
         loss = F.kl_div(
             (pred + 1e-8).log(),
             target,
-            reduction="batchmean",
-        )
-        return loss * self.attr_cluster_loss_weight 
+            reduction="none",
+        ).sum(dim=1)
+        return (
+            (loss * weights).mean()
+        ) * self.attr_cluster_loss_weight
 
     def _build_cluster_targets_from_incidence(
         self, incidence: torch.Tensor, device: torch.device

@@ -1008,10 +1008,16 @@ class CommonalityROIHeads(ROIHeads):
                 
             return [], losses
         else:            
+            fused_scores = None
+            if self.attribute_branch and self.attribute_branch.gate_enabled:
+                fused_scores = self.attribute_branch.semantic_fusion_probs(
+                    box_features, pred_class_logits
+                )
             pred_instances, kept_indices = outputs.inference(
                 self.test_score_thresh,
                 self.test_nms_thresh,
                 self.test_detections_per_img,
+                scores_override=fused_scores,
             )
             return pred_instances, {}
 

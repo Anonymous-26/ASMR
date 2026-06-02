@@ -507,7 +507,7 @@ class FastRCNNOutputs(object):
         probs = F.softmax(self.pred_class_logits, dim=-1)
         return probs.split(self.num_preds_per_image, dim=0)
 
-    def inference(self, score_thresh, nms_thresh, topk_per_image):
+    def inference(self, score_thresh, nms_thresh, topk_per_image, scores_override=None):
         """
         Args:
             score_thresh (float): same as fast_rcnn_inference.
@@ -518,7 +518,11 @@ class FastRCNNOutputs(object):
             list[Tensor]: same as fast_rcnn_inference.
         """
         boxes = self.predict_boxes()
-        scores = self.predict_probs()
+        scores = (
+            scores_override.split(self.num_preds_per_image, dim=0)
+            if scores_override is not None
+            else self.predict_probs()
+        )
         class_logits = torch.split(self.pred_class_logits, self.num_preds_per_image, dim=0)
         image_shapes = self.image_shapes
 

@@ -934,9 +934,19 @@ class CommonalityROIHeads(ROIHeads):
         feature_pooled = box_features.mean(dim=[2, 3])  # pooled to 1x1
         feature_pooled_s = F.relu(self.fc_s(feature_pooled))
         feature_pooled_l = F.relu(self.fc_l(feature_pooled))
-        
+        semantic_state = None
+        classification_features = feature_pooled_s
+        if self.attribute_branch and self.attribute_branch.residual_adapter_enabled:
+            raw_class_logits, _ = self.box_predictor(
+                feature_pooled_s, feature_pooled_l
+            )
+            classification_features, semantic_state = (
+                self.attribute_branch.enhance_visual_features(
+                    box_features, feature_pooled_s, raw_class_logits
+                )
+            )
         pred_class_logits, pred_proposal_deltas = self.box_predictor(
-            feature_pooled_s, feature_pooled_l
+            classification_features, feature_pooled_l
         )
 
         outputs = FastRCNNOutputs(
@@ -1003,21 +1013,17 @@ class CommonalityROIHeads(ROIHeads):
                     losses.update({"loss_cls_score_aug": loss_cls_score_aug * 0.1})
                     
             if self.attribute_branch and not self.attribute_branch._attribute_warmup_active(self.training, storage):
-                attr_losses, attr_targets = self.attribute_branch._attribute_forward(box_features, outputs)
+                attr_losses, attr_targets = self.attribute_branch._attribute_forward(
+                    box_features, outputs, semantic_state=semantic_state
+                )
                 losses.update(attr_losses)
                 
             return [], losses
         else:            
-            fused_scores = None
-            if self.attribute_branch and self.attribute_branch.gate_enabled:
-                fused_scores = self.attribute_branch.semantic_fusion_probs(
-                    box_features, pred_class_logits
-                )
             pred_instances, kept_indices = outputs.inference(
                 self.test_score_thresh,
                 self.test_nms_thresh,
                 self.test_detections_per_img,
-                scores_override=fused_scores,
             )
             return pred_instances, {}
 

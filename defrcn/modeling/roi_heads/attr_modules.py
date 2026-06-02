@@ -102,6 +102,125 @@ class AttributeBilinearMatcher(nn.Module):
                 nn.init.eye_(module.weight)
 
 
+class VisualConditionedAttributeAttention(nn.Module):
+    """
+    Learn RoI-specific responses over shared attributes and aggregate dynamic
+    class prototypes through the attribute-category incidence matrix.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int = 0,
+        temperature: float = 1.0,
+    ) -> None:
+        super().__init__()
+        attention_dim = int(hidden_dim) if hidden_dim and hidden_dim > 0 else int(dim)
+        self.query_proj = nn.Linear(dim, attention_dim, bias=False)
+        self.key_proj = nn.Linear(dim, attention_dim, bias=False)
+        self.scale = attention_dim ** -0.5
+        self.temperature = max(float(temperature), 1e-6)
+        self._init_projection(dim, attention_dim)
+
+    def _init_projection(self, input_dim: int, attention_dim: int) -> None:
+        if input_dim == attention_dim:
+            nn.init.eye_(self.query_proj.weight)
+            nn.init.eye_(self.key_proj.weight)
+        else:
+            nn.init.xavier_uniform_(self.query_proj.weight)
+            nn.init.xavier_uniform_(self.key_proj.weight)
+
+    def forward(
+        self,
+        roi_embeddings: torch.Tensor,
+        attributes: torch.Tensor,
+        incidence: torch.Tensor,
+    ):
+        query = self.query_proj(roi_embeddings)
+        key = self.key_proj(attributes)
+        logits = torch.matmul(query, key.t()) * self.scale / self.temperature
+        responses = F.softmax(logits, dim=1)
+
+        # Each class only aggregates attributes connected by the hypergraph.
+        weights = responses[:, :, None] * incidence[None, :, :]
+        weights = weights / weights.sum(dim=1, keepdim=True).clamp(min=1e-12)
+        prototypes = torch.einsum("nac,ad->ncd", weights, attributes)
+        return F.normalize(prototypes, dim=-1), responses
+
+
+class BoundedSemanticResidualAdapter(nn.Module):
+    """
+    Inject a bounded semantic residual into visual classification features.
+    The residual projection starts from zero, preserving the visual baseline at
+    initialization.
+    """
+
+    def __init__(
+        self,
+        semantic_dim: int,
+        visual_dim: int,
+        hidden_dim: int = 0,
+        gate_hidden_dim: int = 128,
+        max_scale: float = 0.2,
+        detach_gate_inputs: bool = True,
+    ) -> None:
+        super().__init__()
+        if hidden_dim and hidden_dim > 0:
+            self.residual_proj = nn.Sequential(
+                nn.Linear(semantic_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, visual_dim),
+            )
+        else:
+            self.residual_proj = nn.Linear(semantic_dim, visual_dim)
+        self.gate = nn.Sequential(
+            nn.Linear(visual_dim + 2, int(gate_hidden_dim)),
+            nn.ReLU(inplace=True),
+            nn.Linear(int(gate_hidden_dim), 1),
+        )
+        self.max_scale = max(float(max_scale), 0.0)
+        self.detach_gate_inputs = bool(detach_gate_inputs)
+        self._init_residual_projection()
+
+    def _init_residual_projection(self) -> None:
+        for module in self.residual_proj.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.zeros_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    @staticmethod
+    def _visual_uncertainty(visual_logits: torch.Tensor):
+        probs = F.softmax(visual_logits, dim=-1)
+        foreground_probs = probs[:, :-1]
+        entropy = -(probs * probs.clamp(min=1e-8).log()).sum(dim=1, keepdim=True)
+        entropy = entropy / np.log(max(probs.shape[1], 2))
+        topk = min(2, foreground_probs.shape[1])
+        top_probs = torch.topk(foreground_probs, k=topk, dim=1).values
+        margin = top_probs[:, :1]
+        if topk > 1:
+            margin = top_probs[:, :1] - top_probs[:, 1:2]
+        return entropy, margin
+
+    def forward(
+        self,
+        visual_features: torch.Tensor,
+        semantic_context: torch.Tensor,
+        visual_logits: torch.Tensor,
+    ):
+        entropy, margin = self._visual_uncertainty(visual_logits)
+        gate_features = visual_features
+        if self.detach_gate_inputs:
+            gate_features = gate_features.detach()
+            entropy = entropy.detach()
+            margin = margin.detach()
+        gate_inputs = torch.cat([gate_features, entropy, margin], dim=1)
+        scales = torch.sigmoid(self.gate(gate_inputs)).squeeze(1) * self.max_scale
+        residual = self.residual_proj(semantic_context)
+        enhanced = visual_features + scales[:, None] * residual
+        return enhanced, scales, residual, entropy, margin
+
+
 class AttributeClusterProjector(nn.Module):
     """
     可学习簇原型投影：将 z_k 映射到更适合视觉区分的空间。

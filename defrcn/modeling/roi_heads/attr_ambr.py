@@ -77,6 +77,17 @@ class AMBR(nn.Module):
         self.attention_enabled = bool(self.attention_cfg.ENABLED)
         self.residual_adapter_cfg = self.attr_cfg.RESIDUAL_ADAPTER
         self.residual_adapter_enabled = bool(self.residual_adapter_cfg.ENABLED)
+        self.visual_proto_cfg = self.attr_cfg.VISUAL_PROTOTYPE
+        self.visual_proto_enabled = bool(self.visual_proto_cfg.ENABLED)
+        self.visual_proto_momentum = float(self.visual_proto_cfg.MOMENTUM)
+        self.visual_proto_max_weight = float(self.visual_proto_cfg.MAX_WEIGHT)
+        self.visual_proto_count_tau = float(self.visual_proto_cfg.COUNT_TAU)
+        self.visual_proto_min_updates = int(self.visual_proto_cfg.MIN_UPDATES)
+        self.visual_proto_mix_dynamic = bool(self.visual_proto_cfg.MIX_DYNAMIC)
+        self.visual_proto_mix_static = bool(self.visual_proto_cfg.MIX_STATIC)
+        self.visual_proto_context_from_mixed = bool(
+            self.visual_proto_cfg.SEMANTIC_CONTEXT_FROM_MIXED
+        )
         self.attr_monitor: Optional[AttributeMonitor] = None
         self.novel_class_indices = list(novel_index)
         self.base_index = base_index
@@ -212,6 +223,18 @@ class AMBR(nn.Module):
             "attr_class_prototypes",
             torch.zeros(self.num_classes + 1, self.attr_cfg.EMBEDDING_DIM),
         )
+        self.register_buffer(
+            "visual_ema_class_prototypes",
+            torch.zeros(self.num_classes + 1, match_dim),
+        )
+        self.register_buffer(
+            "visual_ema_class_counts",
+            torch.zeros(self.num_classes + 1),
+        )
+        self.register_buffer(
+            "visual_ema_class_updates",
+            torch.zeros(self.num_classes + 1),
+        )
 
         if self.attr_cfg.FREEZE_ALIGN_BILINEAR and self.attr_bilinear is not None:
             for p in self.attr_bilinear.parameters():
@@ -307,6 +330,22 @@ class AMBR(nn.Module):
             )
             semantic_context = torch.matmul(attention, cluster_embeddings)
             self._log_visual_attribute_attention(attention)
+        class_prototypes, dynamic_prototypes = self._mix_with_visual_prototypes(
+            class_prototypes, dynamic_prototypes
+        )
+        if (
+            self.visual_proto_enabled
+            and self.visual_proto_context_from_mixed
+            and dynamic_prototypes is not None
+        ):
+            class_logits = self._compute_class_logits(
+                attr_embeddings, class_prototypes, dynamic_prototypes
+            )[:, : self.num_classes]
+            top_classes = class_logits.argmax(dim=1)
+            row_indices = torch.arange(
+                dynamic_prototypes.shape[0], device=dynamic_prototypes.device
+            )
+            semantic_context = dynamic_prototypes[row_indices, top_classes]
         return (
             attr_embeddings,
             cluster_embeddings,
@@ -408,6 +447,7 @@ class AMBR(nn.Module):
             losses["loss_attr_cluster"] = cluster_loss
         if self.attr_monitor is not None:
             self._log_attribute_monitor(class_prototypes)
+        self._update_visual_prototypes(attr_embeddings, outputs.gt_classes)
         return losses, attr_targets
 
     def _update_prototype_cache(self, class_prototypes: torch.Tensor):
@@ -482,6 +522,163 @@ class AMBR(nn.Module):
         if dynamic_prototypes is None:
             return torch.matmul(attr_embeddings, class_prototypes.t())
         return torch.einsum("nd,ncd->nc", attr_embeddings, dynamic_prototypes)
+
+    def _visual_prototype_weights(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        num_rows: Optional[int] = None,
+    ) -> torch.Tensor:
+        if not self.visual_proto_enabled:
+            count = self.num_classes + 1 if num_rows is None else int(num_rows)
+            return torch.zeros(count, device=device, dtype=dtype)
+        counts = self.visual_ema_class_counts.to(device=device, dtype=dtype)
+        updates = self.visual_ema_class_updates.to(device=device, dtype=dtype)
+        if num_rows is not None:
+            counts = counts[:num_rows]
+            updates = updates[:num_rows]
+        weights = counts / (counts + max(self.visual_proto_count_tau, 1e-6))
+        weights = weights * max(self.visual_proto_max_weight, 0.0)
+        weights = torch.where(
+            updates >= float(max(self.visual_proto_min_updates, 0)),
+            weights,
+            torch.zeros_like(weights),
+        )
+        if weights.numel() > self.num_classes:
+            weights[self.num_classes :] = 0.0
+        return weights.clamp(min=0.0, max=1.0)
+
+    def _mix_with_visual_prototypes(
+        self,
+        class_prototypes: torch.Tensor,
+        dynamic_prototypes: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if not self.visual_proto_enabled:
+            return class_prototypes, dynamic_prototypes
+        visual = self.visual_ema_class_prototypes.to(
+            device=class_prototypes.device, dtype=class_prototypes.dtype
+        )
+        count = min(class_prototypes.shape[0], visual.shape[0])
+        weights = self._visual_prototype_weights(
+            class_prototypes.device, class_prototypes.dtype, count
+        )
+        mixed_static = class_prototypes
+        if self.visual_proto_mix_static and count > 0:
+            mixed_static = class_prototypes.clone()
+            static_part = (
+                (1.0 - weights[:count, None]) * class_prototypes[:count]
+                + weights[:count, None] * visual[:count]
+            )
+            mixed_static[:count] = F.normalize(static_part, dim=-1)
+
+        mixed_dynamic = dynamic_prototypes
+        if (
+            self.visual_proto_mix_dynamic
+            and dynamic_prototypes is not None
+            and count > 0
+        ):
+            mixed_dynamic = dynamic_prototypes.clone()
+            dynamic_part = (
+                (1.0 - weights[None, :count, None])
+                * dynamic_prototypes[:, :count]
+                + weights[None, :count, None] * visual[None, :count]
+            )
+            mixed_dynamic[:, :count] = F.normalize(dynamic_part, dim=-1)
+        return mixed_static, mixed_dynamic
+
+    @torch.no_grad()
+    def _update_visual_prototypes(
+        self,
+        attr_embeddings: torch.Tensor,
+        gt_classes: Optional[torch.Tensor],
+    ) -> None:
+        if not self.visual_proto_enabled or gt_classes is None:
+            return
+        foreground = (gt_classes >= 0) & (gt_classes < self.num_classes)
+        if not torch.any(foreground):
+            self._log_visual_prototype_stats()
+            return
+        embeddings = F.normalize(attr_embeddings.detach()[foreground], dim=-1)
+        labels = gt_classes.detach()[foreground]
+        class_sums = embeddings.new_zeros(
+            (self.num_classes, embeddings.shape[1])
+        )
+        class_counts = embeddings.new_zeros(self.num_classes)
+        class_sums.index_add_(0, labels, embeddings)
+        class_counts.index_add_(
+            0, labels, embeddings.new_ones(labels.shape[0])
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(class_sums)
+            dist.all_reduce(class_counts)
+        momentum = min(max(self.visual_proto_momentum, 0.0), 0.9999)
+        updated_classes = torch.nonzero(
+            class_counts > 0, as_tuple=False
+        ).squeeze(1)
+        for class_index in updated_classes:
+            cls = int(class_index.item())
+            class_mean = F.normalize(
+                class_sums[cls : cls + 1] / class_counts[cls].clamp(min=1.0),
+                dim=-1,
+            ).squeeze(0)
+            if self.visual_ema_class_updates[cls] <= 0:
+                updated = class_mean
+            else:
+                updated = (
+                    momentum * self.visual_ema_class_prototypes[cls]
+                    + (1.0 - momentum) * class_mean
+                )
+            self.visual_ema_class_prototypes[cls] = F.normalize(
+                updated, dim=0
+            )
+            self.visual_ema_class_counts[cls] += float(class_counts[cls].item())
+            self.visual_ema_class_updates[cls] += 1.0
+        self._log_visual_prototype_stats()
+
+    @torch.no_grad()
+    def _log_visual_prototype_stats(self) -> None:
+        if not self.visual_proto_enabled:
+            return
+        try:
+            storage = get_event_storage()
+        except Exception:
+            return
+        weights = self._visual_prototype_weights(
+            self.visual_ema_class_prototypes.device,
+            self.visual_ema_class_prototypes.dtype,
+        )
+        valid = self.visual_ema_class_updates[: self.num_classes] > 0
+        storage.put_scalar(
+            "attr_visual_proto/num_updated_classes", float(valid.sum().item())
+        )
+        if torch.any(valid):
+            storage.put_scalar(
+                "attr_visual_proto/count_mean",
+                float(self.visual_ema_class_counts[: self.num_classes][valid].mean().item()),
+            )
+            storage.put_scalar(
+                "attr_visual_proto/weight_mean",
+                float(weights[: self.num_classes][valid].mean().item()),
+            )
+            storage.put_scalar(
+                "attr_visual_proto/weight_max",
+                float(weights[: self.num_classes][valid].max().item()),
+            )
+            if (
+                self.attr_class_prototypes.shape[1]
+                == self.visual_ema_class_prototypes.shape[1]
+            ):
+                text = F.normalize(
+                    self.attr_class_prototypes[: self.num_classes][valid], dim=-1
+                )
+                visual = F.normalize(
+                    self.visual_ema_class_prototypes[: self.num_classes][valid],
+                    dim=-1,
+                )
+                storage.put_scalar(
+                    "attr_visual_proto/text_visual_cosine",
+                    float((text * visual).sum(dim=1).mean().item()),
+                )
 
     def _log_visual_attribute_attention(self, attention: torch.Tensor) -> None:
         if attention.numel() == 0:

@@ -32,11 +32,43 @@ def surgery_loop(args, surgery):
         for idx, (param_name, tar_size) in enumerate(zip(args.param_name, tar_sizes)):
             surgery(param_name, True, tar_size, ckpt)
             surgery(param_name, False, tar_size, ckpt)
+        expand_attribute_buffers(args, ckpt)
     else:
         raise NotImplementedError
 
     torch.save(ckpt, save_path)
     print('save changed ckpt to {}'.format(save_path))
+
+
+def expand_attribute_buffers(args, ckpt):
+    attr_buffer_names = [
+        'roi_heads.attribute_branch.attr_class_prototypes',
+        'roi_heads.attribute_branch.visual_ema_class_prototypes',
+        'roi_heads.attribute_branch.visual_ema_class_counts',
+        'roi_heads.attribute_branch.visual_ema_class_updates',
+    ]
+    for buffer_name in attr_buffer_names:
+        if buffer_name not in ckpt['model']:
+            continue
+        pretrained = ckpt['model'][buffer_name]
+        if pretrained.size(0) == TAR_SIZE + 1:
+            continue
+        if pretrained.dim() == 1:
+            expanded = torch.zeros((TAR_SIZE + 1,), dtype=pretrained.dtype)
+        else:
+            expanded = torch.zeros(
+                (TAR_SIZE + 1,) + tuple(pretrained.shape[1:]),
+                dtype=pretrained.dtype,
+            )
+        prev_fg = pretrained.size(0) - 1
+        if args.dataset == 'coco':
+            for idx, c in enumerate(BASE_CLASSES):
+                expanded[IDMAP[c]] = pretrained[idx]
+        else:
+            expanded[:prev_fg] = pretrained[:prev_fg]
+        expanded[-1] = pretrained[-1]
+        ckpt['model'][buffer_name] = expanded
+        print(buffer_name, pretrained.shape, expanded.shape)
 
 
 def main(args):

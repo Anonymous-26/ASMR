@@ -298,6 +298,7 @@ class AMBR(nn.Module):
         )
         self._update_prototype_cache(class_prototypes)
         dynamic_prototypes = None
+        attention = None
         semantic_context = None
         if self.visual_attribute_attention is not None:
             aligned_incidence = self._align_incidence_to_current_classes(incidence)
@@ -312,6 +313,7 @@ class AMBR(nn.Module):
             incidence,
             class_prototypes,
             dynamic_prototypes,
+            attention,
             semantic_context,
         )
 
@@ -372,8 +374,18 @@ class AMBR(nn.Module):
             incidence,
             class_prototypes,
             dynamic_prototypes,
+            attention,
             _,
         ) = semantic_state
+        self._log_weakly_supervised_attribute_metrics(
+            attr_embeddings,
+            cluster_embeddings,
+            incidence,
+            class_prototypes,
+            dynamic_prototypes,
+            attention,
+            outputs.gt_classes,
+        )
         attr_targets = outputs.gt_classes
         if attr_targets is not None:
             attr_targets = attr_targets.clone()
@@ -487,6 +499,157 @@ class AMBR(nn.Module):
             "attr_attention/top1_response_mean",
             float(detached.max(dim=1).values.mean().item()),
         )
+        if detached.shape[0] > 1:
+            centered = detached - detached.mean(dim=0, keepdim=True)
+            storage.put_scalar(
+                "attr_attention/roi_response_std_mean",
+                float(centered.square().mean(dim=0).sqrt().mean().item()),
+            )
+
+    def _build_attribute_responses(
+        self,
+        attr_embeddings: torch.Tensor,
+        cluster_embeddings: torch.Tensor,
+        attention: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if attention is not None:
+            return attention
+        attr_embeddings = F.normalize(attr_embeddings, dim=-1)
+        cluster_embeddings = F.normalize(cluster_embeddings, dim=-1)
+        logits = torch.matmul(attr_embeddings, cluster_embeddings.t())
+        return F.softmax(logits / self.attr_temperature, dim=1)
+
+    @torch.no_grad()
+    def _attribute_inference(self, box_features: torch.Tensor, semantic_state=None):
+        if semantic_state is None:
+            semantic_state = self._build_semantic_state(box_features)
+        if semantic_state is None:
+            return None, None
+        (
+            attr_embeddings,
+            cluster_embeddings,
+            _,
+            class_prototypes,
+            dynamic_prototypes,
+            attention,
+            _,
+        ) = semantic_state
+        class_logits = self._compute_class_logits(
+            attr_embeddings, class_prototypes, dynamic_prototypes
+        )
+        class_probs = F.softmax(class_logits / self.attr_temperature, dim=1)
+        cluster_probs = self._build_attribute_responses(
+            attr_embeddings, cluster_embeddings, attention
+        )
+        return class_probs, cluster_probs
+
+    @torch.no_grad()
+    def _log_weakly_supervised_attribute_metrics(
+        self,
+        attr_embeddings: torch.Tensor,
+        cluster_embeddings: torch.Tensor,
+        incidence: torch.Tensor,
+        class_prototypes: torch.Tensor,
+        dynamic_prototypes: Optional[torch.Tensor],
+        attention: Optional[torch.Tensor],
+        gt_classes: Optional[torch.Tensor],
+    ) -> None:
+        if gt_classes is None:
+            return
+        foreground = (gt_classes >= 0) & (gt_classes < self.num_classes)
+        if not torch.any(foreground):
+            return
+        try:
+            storage = get_event_storage()
+        except Exception:
+            return
+
+        responses = self._build_attribute_responses(
+            attr_embeddings, cluster_embeddings, attention
+        )[foreground]
+        labels = gt_classes[foreground]
+        aligned_incidence = self._align_incidence_to_current_classes(incidence)
+        allowed = aligned_incidence[:, labels].t() > 0
+        storage.put_scalar("attr_eval/num_fg_rois", float(labels.numel()))
+
+        num_attributes = responses.shape[1]
+        for requested_k in (1, 3, 5):
+            k = min(requested_k, num_attributes)
+            if k <= 0:
+                continue
+            topk = responses.topk(k, dim=1).indices
+            hits = allowed.gather(1, topk)
+            storage.put_scalar(
+                "attr_eval/weak_precision_at_{}".format(requested_k),
+                float(hits.float().mean().item()),
+            )
+            storage.put_scalar(
+                "attr_eval/weak_any_hit_at_{}".format(requested_k),
+                float(hits.any(dim=1).float().mean().item()),
+            )
+
+        entropy = -(
+            responses * responses.clamp(min=1e-8).log()
+        ).sum(dim=1)
+        storage.put_scalar(
+            "attr_eval/effective_num_attributes",
+            float(entropy.exp().mean().item()),
+        )
+
+        class_logits = self._compute_class_logits(
+            attr_embeddings[foreground],
+            class_prototypes,
+            dynamic_prototypes[foreground]
+            if dynamic_prototypes is not None
+            else None,
+        )[:, : self.num_classes]
+        storage.put_scalar(
+            "attr_eval/class_top1_accuracy",
+            float((class_logits.argmax(dim=1) == labels).float().mean().item()),
+        )
+        topk = min(5, class_logits.shape[1])
+        storage.put_scalar(
+            "attr_eval/class_top5_accuracy",
+            float(
+                (class_logits.topk(topk, dim=1).indices == labels[:, None])
+                .any(dim=1)
+                .float()
+                .mean()
+                .item()
+            ),
+        )
+
+        if labels.numel() < 2:
+            return
+        normalized = F.normalize(responses, dim=1)
+        similarities = torch.matmul(normalized, normalized.t())
+        pair_mask = torch.triu(
+            torch.ones_like(similarities, dtype=torch.bool), diagonal=1
+        )
+        same_class = labels[:, None] == labels[None, :]
+        intra_mask = pair_mask & same_class
+        inter_mask = pair_mask & (~same_class)
+        storage.put_scalar("attr_eval/num_intra_pairs", float(intra_mask.sum().item()))
+        storage.put_scalar("attr_eval/num_inter_pairs", float(inter_mask.sum().item()))
+        if torch.any(intra_mask):
+            intra_similarity = similarities[intra_mask].mean()
+            storage.put_scalar(
+                "attr_eval/intra_class_similarity", float(intra_similarity.item())
+            )
+        else:
+            intra_similarity = None
+        if torch.any(inter_mask):
+            inter_similarity = similarities[inter_mask].mean()
+            storage.put_scalar(
+                "attr_eval/inter_class_similarity", float(inter_similarity.item())
+            )
+        else:
+            inter_similarity = None
+        if intra_similarity is not None and inter_similarity is not None:
+            storage.put_scalar(
+                "attr_eval/class_separation_gap",
+                float((intra_similarity - inter_similarity).item()),
+            )
 
     def _log_attribute_monitor(
         self,
@@ -689,12 +852,13 @@ class AMBR(nn.Module):
         )
         return penalty, gt_classes
     
-    def _attribute_warmup_active(self, is_training, training_iter):
+    def _attribute_warmup_active(self, training_iter):
         if self.is_warmuped:
             return True
-        if not is_training or self.attr_warmup_iters <= 0:
-            return False
-        if int(training_iter.iter) > self.attr_warmup_iters:
+        if self.attr_warmup_iters <= 0:
+            self.is_warmuped = True
+            return True
+        if int(training_iter.iter) >= self.attr_warmup_iters:
             self.is_warmuped = True
         return  self.is_warmuped
     

@@ -118,7 +118,6 @@ class VisualConditionedAttributeAttention(nn.Module):
         attention_dim = int(hidden_dim) if hidden_dim and hidden_dim > 0 else int(dim)
         self.query_proj = nn.Linear(dim, attention_dim, bias=False)
         self.key_proj = nn.Linear(dim, attention_dim, bias=False)
-        self.scale = attention_dim ** -0.5
         self.temperature = max(float(temperature), 1e-6)
         self._init_projection(dim, attention_dim)
 
@@ -136,9 +135,9 @@ class VisualConditionedAttributeAttention(nn.Module):
         attributes: torch.Tensor,
         incidence: torch.Tensor,
     ):
-        query = self.query_proj(roi_embeddings)
-        key = self.key_proj(attributes)
-        logits = torch.matmul(query, key.t()) * self.scale / self.temperature
+        query = F.normalize(self.query_proj(roi_embeddings), dim=-1)
+        key = F.normalize(self.key_proj(attributes), dim=-1)
+        logits = torch.matmul(query, key.t()) / self.temperature
         responses = F.softmax(logits, dim=1)
 
         # Each class only aggregates attributes connected by the hypergraph.

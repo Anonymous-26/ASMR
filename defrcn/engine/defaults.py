@@ -626,8 +626,8 @@ class Trainer(DefaultTrainer):
         if evaluator_type == "pascal_voc":
             from defrcn.evaluation import PascalVOCDetectionEvaluator
             evaluator_list.append(PascalVOCDetectionEvaluator(dataset_name))
-        # if cfg.MODEL.ATTRIBUTE.ENABLED: ## changed temporary
-        # evaluator_list.append(AttributeEvaluator(cfg, dataset_name))
+        if cfg.MODEL.ATTRIBUTE.ENABLED:
+            evaluator_list.append(AttributeEvaluator(cfg, dataset_name))
         from defrcn.evaluation import EvalResultsExporter
         # evaluator_list.append(EvalResultsExporter(cfg, dataset_name, cfg.OUTPUT_DIR))
         if len(evaluator_list) == 0:

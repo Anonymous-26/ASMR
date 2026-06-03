@@ -1012,7 +1012,7 @@ class CommonalityROIHeads(ROIHeads):
                         )
                     losses.update({"loss_cls_score_aug": loss_cls_score_aug * 0.1})
                     
-            if self.attribute_branch and not self.attribute_branch._attribute_warmup_active(self.training, storage):
+            if self.attribute_branch and self.attribute_branch._attribute_warmup_active(storage):
                 attr_losses, attr_targets = self.attribute_branch._attribute_forward(
                     box_features, outputs, semantic_state=semantic_state
                 )
@@ -1020,11 +1020,23 @@ class CommonalityROIHeads(ROIHeads):
                 
             return [], losses
         else:            
-            pred_instances, kept_indices = outputs.inference(
-                self.test_score_thresh,
-                self.test_nms_thresh,
-                self.test_detections_per_img,
-            )
+            if self.attribute_branch and self.attribute_branch.attr_enabled:
+                attr_probs, cluster_probs = self.attribute_branch._attribute_inference(
+                    box_features, semantic_state=semantic_state
+                )
+                pred_instances, kept_indices = outputs.inference_with_attr(
+                    self.test_score_thresh,
+                    self.test_nms_thresh,
+                    self.test_detections_per_img,
+                    attr_probs,
+                    cluster_probs,
+                )
+            else:
+                pred_instances, kept_indices = outputs.inference(
+                    self.test_score_thresh,
+                    self.test_nms_thresh,
+                    self.test_detections_per_img,
+                )
             return pred_instances, {}
 
 

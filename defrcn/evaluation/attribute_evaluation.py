@@ -258,10 +258,39 @@ class AttributeEvaluator(DatasetEvaluator):
         )
         cluster_state = prototype_bank.get_cluster_state(torch.device("cpu"))
         incidence = cluster_state["incidence"]
+        if self.num_classes == 15:
+            base_indices = [
+                idx for idx in range(20)
+                if idx not in {15, 16, 17, 18, 19}
+            ]
+            incidence = incidence[:, base_indices]
+        elif self.num_classes == 60:
+            coco_novel_indices = {
+                0, 1, 2, 3, 4, 5, 6, 8, 14, 15,
+                16, 17, 18, 19, 39, 56, 57, 58, 60, 62,
+            }
+            base_indices = [
+                idx for idx in range(80) if idx not in coco_novel_indices
+            ]
+            incidence = incidence[:, base_indices]
+        else:
+            incidence = incidence[:, : self.num_classes]
         self.cluster_category = (incidence > 0.0).to(torch.bool)
         self.num_clusters = int(self.cluster_category.shape[0])
+        if self.num_classes == 20:
+            self.novel_class_indices = {15, 16, 17, 18, 19}
+        elif self.num_classes == 80:
+            self.novel_class_indices = {
+                0, 1, 2, 3, 4, 5, 6, 8, 14, 15,
+                16, 17, 18, 19, 39, 56, 57, 58, 60, 62,
+            }
+        else:
+            self.novel_class_indices = set()
 
         self.reset()
+
+    def _is_base_class(self, class_index: int) -> bool:
+        return class_index not in self.novel_class_indices
 
     def reset(self) -> None:
         self.det_class_total = 0
@@ -290,6 +319,8 @@ class AttributeEvaluator(DatasetEvaluator):
         self.attr_class_rec_novel_correct = {k: 0 for k in self.class_topk_values}
         self.attr_cluster_total = 0
         self.attr_cluster_correct = {k: 0 for k in self.cluster_topk_values}
+        self.attr_cluster_hit_slots = {k: 0 for k in self.cluster_topk_values}
+        self.attr_cluster_any_hit = {k: 0 for k in self.cluster_topk_values}
         self.attr_cluster_base_total = 0
         self.attr_cluster_base_correct = {k: 0 for k in self.cluster_topk_values}
         self.attr_cluster_novel_total = 0
@@ -322,7 +353,7 @@ class AttributeEvaluator(DatasetEvaluator):
             valid_gt_mask = (gt_classes >= 0) & (gt_classes < self.num_classes)
             if torch.any(valid_gt_mask):
                 for gt_class in gt_classes[valid_gt_mask].tolist():
-                    is_base = gt_class < 15
+                    is_base = self._is_base_class(gt_class)
                     self.det_class_rec_total += 1
                     self.attr_class_rec_total += 1
                     if is_base:
@@ -356,7 +387,7 @@ class AttributeEvaluator(DatasetEvaluator):
                 if det_class_probs is not None and det_class_probs.shape[0] > pred_idx:
                     class_probs = det_class_probs[pred_idx]
                     self.det_class_total += 1
-                    is_base = gt_class < 15
+                    is_base = self._is_base_class(gt_class)
                     if is_base:
                         self.det_class_base_total += 1
                     else:
@@ -381,7 +412,7 @@ class AttributeEvaluator(DatasetEvaluator):
                 if attr_probs is not None and attr_probs.shape[0] > pred_idx:
                     class_probs = attr_probs[pred_idx]
                     self.attr_class_total += 1
-                    is_base = gt_class < 15
+                    is_base = self._is_base_class(gt_class)
                     if is_base:
                         self.attr_class_base_total += 1
                     else:
@@ -419,7 +450,7 @@ class AttributeEvaluator(DatasetEvaluator):
                     gt_bool = gt_attr.to(torch.bool)
                     self.per_attr_total += gt_bool.to(torch.int64).cpu().numpy()
                     self.attr_cluster_total += 1
-                    is_base = gt_class < 15
+                    is_base = self._is_base_class(gt_class)
                     if is_base:
                         self.attr_cluster_base_total += 1
                     else:
@@ -430,18 +461,21 @@ class AttributeEvaluator(DatasetEvaluator):
                         if limit <= 0:
                             continue
                         topk_idx = order[:limit]
-                        strict_hit = bool(gt_bool[topk_idx].all().item())
+                        topk_hits = gt_bool[topk_idx]
+                        strict_hit = bool(topk_hits.all().item())
+                        self.attr_cluster_hit_slots[topk] += int(topk_hits.sum().item())
+                        if torch.any(topk_hits):
+                            self.attr_cluster_any_hit[topk] += 1
                         if strict_hit:
                             self.attr_cluster_correct[topk] += 1
                             if is_base:
                                 self.attr_cluster_base_correct[topk] += 1
                             else:
                                 self.attr_cluster_novel_correct[topk] += 1
-                        if strict_hit:
-                            hit_mask = torch.zeros_like(gt_bool, dtype=torch.bool)
-                            hit_mask[topk_idx] = True
-                            per_hit = (gt_bool & hit_mask).to(torch.int64).cpu().numpy()
-                            self.per_attr_correct[topk] += per_hit
+                        hit_mask = torch.zeros_like(gt_bool, dtype=torch.bool)
+                        hit_mask[topk_idx] = True
+                        per_hit = (gt_bool & hit_mask).to(torch.int64).cpu().numpy()
+                        self.per_attr_correct[topk] += per_hit
 
     def evaluate(self) -> Dict[str, Dict[str, float]]:
         metrics: Dict[str, float] = {}
@@ -507,6 +541,12 @@ class AttributeEvaluator(DatasetEvaluator):
                 self.attr_cluster_novel_correct[1],
                 self.attr_cluster_novel_correct[2],
                 self.attr_cluster_novel_correct[3],
+                self.attr_cluster_hit_slots[1],
+                self.attr_cluster_hit_slots[2],
+                self.attr_cluster_hit_slots[3],
+                self.attr_cluster_any_hit[1],
+                self.attr_cluster_any_hit[2],
+                self.attr_cluster_any_hit[3],
             ],
             dtype=np.int64,
         )
@@ -582,6 +622,12 @@ class AttributeEvaluator(DatasetEvaluator):
             cluster_novel_c1,
             cluster_novel_c2,
             cluster_novel_c3,
+            cluster_hit_slots1,
+            cluster_hit_slots2,
+            cluster_hit_slots3,
+            cluster_any_hit1,
+            cluster_any_hit2,
+            cluster_any_hit3,
         ) = totals.tolist()
         per_attr_total = np.sum(np.stack([x[0] for x in all_per_attr], axis=0), axis=0)
         per_attr_c1 = np.sum(np.stack([x[1] for x in all_per_attr], axis=0), axis=0)
@@ -690,6 +736,24 @@ class AttributeEvaluator(DatasetEvaluator):
             metrics["attr_cluster_top1_acc"] = float(cluster_c1 / max(1, cluster_total))
             metrics["attr_cluster_top2_acc"] = float(cluster_c2 / max(1, cluster_total))
             metrics["attr_cluster_top3_acc"] = float(cluster_c3 / max(1, cluster_total))
+            metrics["attr_cluster_precision_at_1"] = float(
+                cluster_hit_slots1 / max(1, cluster_total)
+            )
+            metrics["attr_cluster_precision_at_2"] = float(
+                cluster_hit_slots2 / max(1, cluster_total * 2)
+            )
+            metrics["attr_cluster_precision_at_3"] = float(
+                cluster_hit_slots3 / max(1, cluster_total * 3)
+            )
+            metrics["attr_cluster_any_hit_at_1"] = float(
+                cluster_any_hit1 / max(1, cluster_total)
+            )
+            metrics["attr_cluster_any_hit_at_2"] = float(
+                cluster_any_hit2 / max(1, cluster_total)
+            )
+            metrics["attr_cluster_any_hit_at_3"] = float(
+                cluster_any_hit3 / max(1, cluster_total)
+            )
         if cluster_base_total > 0:
             metrics["attr_cluster_base_top1_acc"] = float(
                 cluster_base_c1 / max(1, cluster_base_total)

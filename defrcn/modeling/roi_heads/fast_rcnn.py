@@ -160,7 +160,6 @@ def fast_rcnn_inference_single_image_with_attr(
     """
     scores = scores[:, :-1]
     attr_prob = attr_prob[:, :-1] if attr_prob is not None else None
-    cluster_prob = cluster_prob[:, :-1] if cluster_prob is not None else None
     num_bbox_reg_classes = boxes.shape[1] // 4
     # Convert to Boxes to use the `clip` function ...
     boxes = Boxes(boxes.reshape(-1, 4))
@@ -214,6 +213,7 @@ def fast_rcnn_inference_single_image_with_attr(
         logits_scores = logits_scores[keep]
         result.pred_class_logits = logits
         result.pred_class_scores = logits_scores
+        result.det_class_probs = logits_scores
 
     return result, filter_inds[:, 0]
 
@@ -529,6 +529,33 @@ class FastRCNNOutputs(object):
             score_thresh,
             nms_thresh,
             topk_per_image,
+            class_logits=list(class_logits),
+        )
+
+    def inference_with_attr(
+        self,
+        score_thresh,
+        nms_thresh,
+        topk_per_image,
+        attr_probs,
+        cluster_probs,
+    ):
+        boxes = self.predict_boxes()
+        scores = self.predict_probs()
+        class_logits = torch.split(
+            self.pred_class_logits, self.num_preds_per_image, dim=0
+        )
+        attr_probs = torch.split(attr_probs, self.num_preds_per_image, dim=0)
+        cluster_probs = torch.split(cluster_probs, self.num_preds_per_image, dim=0)
+        return fast_rcnn_inference_with_attr(
+            boxes,
+            scores,
+            self.image_shapes,
+            score_thresh,
+            nms_thresh,
+            topk_per_image,
+            attr_probs=list(attr_probs),
+            cluster_probs=list(cluster_probs),
             class_logits=list(class_logits),
         )
     

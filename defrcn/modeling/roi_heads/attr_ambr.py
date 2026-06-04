@@ -85,6 +85,8 @@ class AMBR(nn.Module):
         self.visual_proto_min_updates = int(self.visual_proto_cfg.MIN_UPDATES)
         self.visual_proto_mix_dynamic = bool(self.visual_proto_cfg.MIX_DYNAMIC)
         self.visual_proto_mix_static = bool(self.visual_proto_cfg.MIX_STATIC)
+        self.visual_proto_mix_loss = bool(self.visual_proto_cfg.MIX_LOSS)
+        self.visual_proto_mix_inference = bool(self.visual_proto_cfg.MIX_INFERENCE)
         self.visual_proto_context_from_mixed = bool(
             self.visual_proto_cfg.SEMANTIC_CONTEXT_FROM_MIXED
         )
@@ -330,30 +332,41 @@ class AMBR(nn.Module):
             )
             semantic_context = torch.matmul(attention, cluster_embeddings)
             self._log_visual_attribute_attention(attention)
-        class_prototypes, dynamic_prototypes = self._mix_with_visual_prototypes(
-            class_prototypes, dynamic_prototypes
+        mixed_class_prototypes, mixed_dynamic_prototypes = (
+            self._mix_with_visual_prototypes(class_prototypes, dynamic_prototypes)
+        )
+        state_class_prototypes = (
+            mixed_class_prototypes if self.visual_proto_mix_loss else class_prototypes
+        )
+        state_dynamic_prototypes = (
+            mixed_dynamic_prototypes
+            if self.visual_proto_mix_loss
+            else dynamic_prototypes
         )
         if (
             self.visual_proto_enabled
             and self.visual_proto_context_from_mixed
-            and dynamic_prototypes is not None
+            and mixed_dynamic_prototypes is not None
         ):
             class_logits = self._compute_class_logits(
-                attr_embeddings, class_prototypes, dynamic_prototypes
+                attr_embeddings, mixed_class_prototypes, mixed_dynamic_prototypes
             )[:, : self.num_classes]
             top_classes = class_logits.argmax(dim=1)
             row_indices = torch.arange(
-                dynamic_prototypes.shape[0], device=dynamic_prototypes.device
+                mixed_dynamic_prototypes.shape[0],
+                device=mixed_dynamic_prototypes.device,
             )
-            semantic_context = dynamic_prototypes[row_indices, top_classes]
+            semantic_context = mixed_dynamic_prototypes[row_indices, top_classes]
         return (
             attr_embeddings,
             cluster_embeddings,
             incidence,
-            class_prototypes,
-            dynamic_prototypes,
+            state_class_prototypes,
+            state_dynamic_prototypes,
             attention,
             semantic_context,
+            mixed_class_prototypes,
+            mixed_dynamic_prototypes,
         )
 
     def enhance_visual_features(
@@ -365,7 +378,7 @@ class AMBR(nn.Module):
         semantic_state = self._build_semantic_state(box_features)
         if self.semantic_residual_adapter is None or semantic_state is None:
             return visual_features, semantic_state
-        semantic_context = semantic_state[-1]
+        semantic_context = semantic_state[6]
         enhanced, scales, residual, entropy, margin = self.semantic_residual_adapter(
             visual_features, semantic_context, visual_logits
         )
@@ -414,6 +427,8 @@ class AMBR(nn.Module):
             class_prototypes,
             dynamic_prototypes,
             attention,
+            _,
+            _,
             _,
         ) = semantic_state
         self._log_weakly_supervised_attribute_metrics(
@@ -730,7 +745,12 @@ class AMBR(nn.Module):
             dynamic_prototypes,
             attention,
             _,
+            mixed_class_prototypes,
+            mixed_dynamic_prototypes,
         ) = semantic_state
+        if self.visual_proto_enabled and self.visual_proto_mix_inference:
+            class_prototypes = mixed_class_prototypes
+            dynamic_prototypes = mixed_dynamic_prototypes
         class_logits = self._compute_class_logits(
             attr_embeddings, class_prototypes, dynamic_prototypes
         )

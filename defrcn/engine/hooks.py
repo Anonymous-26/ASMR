@@ -80,9 +80,12 @@ class EvalHookDeFRCN(HookBase):
             self._do_eval()
 
     def after_train(self):
-        # This condition is to prevent the eval from running after a failed training
         if self.trainer.iter + 1 >= self.trainer.max_iter:
-            self._do_eval()
-        # func is likely a closure that holds reference to the trainer
-        # therefore we clean it to avoid circular reference in the end
+            already_evaled_at_final_iter = (
+                self._period > 0
+                and self.trainer.max_iter >= self._start
+                and self.trainer.max_iter % self._period == 0
+            )
+            if not already_evaled_at_final_iter:
+                self._do_eval()
         del self._func

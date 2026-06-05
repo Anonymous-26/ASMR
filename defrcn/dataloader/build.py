@@ -3,6 +3,7 @@ import logging
 import operator
 import itertools
 import numpy as np
+import torch
 import torch.utils.data
 from tabulate import tabulate
 from termcolor import colored
@@ -430,4 +431,5 @@ def trivial_batch_collator(batch):
 
 
 def worker_init_reset_seed(worker_id):
-    seed_all_rng(np.random.randint(2 ** 31) + worker_id)
+    seed = (torch.initial_seed() + worker_id) % (2 ** 31)
+    seed_all_rng(seed)

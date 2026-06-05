@@ -50,8 +50,9 @@ def setup(args):
 
 def main(args):
     cfg = setup(args)
-    # 固定随机种子以尽力保证可复现（可按需注释）
-    set_deterministic(seed=42, rank=comm.get_rank())
+    # Use cfg.SEED when provided; FIXED_SEED keeps old scripts reproducible.
+    seed = cfg.SEED if int(cfg.SEED) >= 0 else int(os.environ.get("FIXED_SEED", 42))
+    set_deterministic(seed=seed, rank=comm.get_rank())
 
     if args.eval_only:
         model = Trainer.build_model(cfg)

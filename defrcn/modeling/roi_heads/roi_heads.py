@@ -1017,6 +1017,14 @@ class CommonalityROIHeads(ROIHeads):
                     box_features, outputs, semantic_state=semantic_state
                 )
                 losses.update(attr_losses)
+                agr_cls_loss = self.attribute_branch._compute_detector_agr_cls_loss(
+                    outputs
+                )
+                if agr_cls_loss is not None:
+                    if self.attribute_branch.agr_replace_detector_loss:
+                        losses["loss_cls"] = agr_cls_loss
+                    else:
+                        losses["loss_cls_agr"] = agr_cls_loss
                 
             return [], losses
         else:            

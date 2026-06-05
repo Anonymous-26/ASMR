@@ -40,7 +40,7 @@ datasets/
 
 weight/
 nohup.out
-configs*/
+configs/configs*/
 logs/
 
 inference*/

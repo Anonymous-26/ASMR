@@ -100,6 +100,14 @@ class AMBR(nn.Module):
         self.agr_soft_reg_suppress_hard_labels = bool(
             self.agr_cfg.SOFT_REG_SUPPRESS_HARD_LABELS
         )
+        self.subs_cfg = self.attr_cfg.SUBS
+        self.subs_enabled = bool(self.subs_cfg.ENABLED)
+        self.subs_topk = int(self.subs_cfg.TOPK)
+        self.subs_risk_norm = str(self.subs_cfg.RISK_NORM).lower()
+        self.subs_suppress_strength = float(self.subs_cfg.SUPPRESS_STRENGTH)
+        self.subs_min_bg_weight = float(self.subs_cfg.MIN_BG_WEIGHT)
+        self.subs_detach_risk = bool(self.subs_cfg.DETACH_RISK)
+        self.subs_apply_stage = str(self.subs_cfg.APPLY_STAGE).lower()
         self.attr_warmup_iters = self.attr_cfg.WARMUP_ITERS
         self.attention_cfg = self.attr_cfg.ATTENTION
         self.attention_enabled = bool(self.attention_cfg.ENABLED)
@@ -127,6 +135,9 @@ class AMBR(nn.Module):
         self.latest_attribute_state = {}
         self.latest_agr_detector_state = None
         self.latest_agr_soft_loss = None
+        self.latest_subs_weights = None
+        self.latest_subs_raw_risk = None
+        self.latest_subs_rel_risk = None
         self.is_warmuped = False
 
         if not self.attr_enabled:
@@ -343,6 +354,7 @@ class AMBR(nn.Module):
             attr_embeddings.device,
             incidence_override=incidence,
         )
+        full_class_prototypes = class_prototypes
         class_prototypes = self._align_prototypes(class_prototypes)
         (
             attr_embeddings,
@@ -351,6 +363,10 @@ class AMBR(nn.Module):
         ) = self._project_attr_and_keys(
             attr_embeddings, cluster_embeddings, class_prototypes
         )
+        if self.attr_bilinear is not None:
+            full_class_prototypes = self.attr_bilinear.project_key(
+                full_class_prototypes
+            )
         self._update_prototype_cache(class_prototypes)
         dynamic_prototypes = None
         attention = None
@@ -397,6 +413,7 @@ class AMBR(nn.Module):
             semantic_context,
             mixed_class_prototypes,
             mixed_dynamic_prototypes,
+            full_class_prototypes,
         )
 
     def enhance_visual_features(
@@ -488,12 +505,234 @@ class AMBR(nn.Module):
             pass
         return loss
 
+    def _valid_subs_novel_indices(
+        self, class_prototypes: torch.Tensor
+    ) -> List[int]:
+        return [
+            int(idx)
+            for idx in self.novel_class_indices
+            if 0 <= int(idx) < class_prototypes.shape[0] - 1
+        ]
+
+    def _subs_current_stage(self) -> str:
+        if self.num_classes in (15, 60):
+            return "base"
+        if self.num_classes in (20, 80):
+            return "novel"
+        return (
+            "novel"
+            if any(0 <= int(idx) < self.num_classes for idx in self.novel_class_indices)
+            else "base"
+        )
+
+    def _subs_stage_active(self, class_prototypes: torch.Tensor) -> bool:
+        if not self.subs_enabled:
+            return False
+        stage = self._subs_current_stage()
+        if self.subs_apply_stage not in ("all", "base", "novel"):
+            raise ValueError(
+                "MODEL.ATTRIBUTE.SUBS.APPLY_STAGE must be one of "
+                "{'base', 'novel', 'all'}, got {}".format(self.subs_apply_stage)
+            )
+        if self.subs_apply_stage == "all":
+            return True
+        return self.subs_apply_stage == stage
+
+    @staticmethod
+    def _tensor_percentile(values: torch.Tensor, q: float) -> Optional[torch.Tensor]:
+        if values is None or values.numel() == 0:
+            return None
+        flat = values.reshape(-1).sort().values
+        index = int(round((flat.numel() - 1) * float(q)))
+        index = max(0, min(index, flat.numel() - 1))
+        return flat[index]
+
+    def _compute_subs_bg_weights(
+        self,
+        attr_embeddings: torch.Tensor,
+        gt_classes: Optional[torch.Tensor],
+        class_prototypes: torch.Tensor,
+        dynamic_prototypes: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        self.latest_subs_weights = None
+        self.latest_subs_raw_risk = None
+        self.latest_subs_rel_risk = None
+        if (
+            not self.subs_enabled
+            or gt_classes is None
+            or attr_embeddings is None
+            or class_prototypes is None
+        ):
+            return None
+        if not self._subs_stage_active(class_prototypes):
+            return None
+        if attr_embeddings.shape[0] != gt_classes.numel():
+            return None
+        bg_mask = gt_classes == self.bg_class_index
+        if not torch.any(bg_mask):
+            return None
+        valid_novel_indices = self._valid_subs_novel_indices(class_prototypes)
+        if not valid_novel_indices:
+            self._log_subs_stats(
+                None,
+                None,
+                None,
+                bg_mask,
+                active=False,
+                num_valid_novel=0,
+            )
+            return None
+
+        if dynamic_prototypes is None:
+            class_logits = self._compute_class_logits(
+                attr_embeddings, class_prototypes, None
+            )
+        else:
+            class_logits = self._compute_class_logits(
+                attr_embeddings, class_prototypes, dynamic_prototypes
+            )
+        class_logits = class_logits[:, : class_prototypes.shape[0] - 1]
+        attr_probs = F.softmax(class_logits, dim=1)
+        novel_indices = torch.as_tensor(
+            valid_novel_indices, device=attr_embeddings.device, dtype=torch.long
+        )
+        novel_probs = attr_probs[:, novel_indices]
+        topk = min(max(self.subs_topk, 1), novel_probs.shape[1])
+        raw_risk = novel_probs.topk(k=topk, dim=1).values.sum(dim=1).clamp(0.0, 1.0)
+        bg_raw_risk = raw_risk[bg_mask]
+        if self.subs_risk_norm == "none":
+            rel_risk = raw_risk
+        elif self.subs_risk_norm == "bg_relative":
+            bg_mean = bg_raw_risk.mean()
+            bg_max = bg_raw_risk.max()
+            denom = (bg_max - bg_mean).clamp(min=1e-6)
+            rel_risk = ((raw_risk - bg_mean) / denom).clamp(0.0, 1.0)
+        else:
+            raise ValueError(
+                "MODEL.ATTRIBUTE.SUBS.RISK_NORM must be one of "
+                "{'bg_relative', 'none'}, got {}".format(self.subs_risk_norm)
+            )
+        if self.subs_detach_risk:
+            risk_for_weight = rel_risk.detach()
+        else:
+            risk_for_weight = rel_risk
+
+        weights = attr_embeddings.new_ones(gt_classes.shape)
+        bg_weights = (1.0 - self.subs_suppress_strength * risk_for_weight).clamp(
+            min=self.subs_min_bg_weight, max=1.0
+        )
+        weights[bg_mask] = bg_weights[bg_mask]
+        self.latest_subs_weights = weights
+        self.latest_subs_raw_risk = raw_risk.detach()
+        self.latest_subs_rel_risk = rel_risk.detach()
+        self._log_subs_stats(
+            weights.detach(),
+            raw_risk.detach(),
+            rel_risk.detach(),
+            bg_mask,
+            active=True,
+            num_valid_novel=len(valid_novel_indices),
+        )
+        return weights
+
+    def _log_subs_stats(
+        self,
+        weights: Optional[torch.Tensor],
+        raw_risk: Optional[torch.Tensor],
+        rel_risk: Optional[torch.Tensor],
+        bg_mask: torch.Tensor,
+        active: bool,
+        num_valid_novel: int = 0,
+    ) -> None:
+        try:
+            storage = get_event_storage()
+        except Exception:
+            return
+        storage.put_scalar("subs/active", float(active))
+        storage.put_scalar(
+            "subs/stage", 0.0 if self._subs_current_stage() == "base" else 1.0
+        )
+        storage.put_scalar("subs/num_bg", float(bg_mask.sum().item()))
+        storage.put_scalar("subs/num_valid_novel", float(num_valid_novel))
+        if (
+            not active
+            or weights is None
+            or raw_risk is None
+            or rel_risk is None
+            or not torch.any(bg_mask)
+        ):
+            return
+        bg_weights = weights[bg_mask]
+        bg_raw_risk = raw_risk[bg_mask]
+        bg_rel_risk = rel_risk[bg_mask]
+        storage.put_scalar("subs/raw_risk_bg_mean", float(bg_raw_risk.mean().item()))
+        storage.put_scalar("subs/raw_risk_bg_max", float(bg_raw_risk.max().item()))
+        storage.put_scalar("subs/rel_risk_bg_mean", float(bg_rel_risk.mean().item()))
+        storage.put_scalar("subs/rel_risk_bg_max", float(bg_rel_risk.max().item()))
+        storage.put_scalar("subs/risk_bg_mean", float(bg_raw_risk.mean().item()))
+        storage.put_scalar("subs/risk_bg_max", float(bg_raw_risk.max().item()))
+        storage.put_scalar("subs/bg_weight_mean", float(bg_weights.mean().item()))
+        storage.put_scalar("subs/bg_weight_min", float(bg_weights.min().item()))
+        bg_weight_p10 = self._tensor_percentile(bg_weights, 0.10)
+        bg_weight_p50 = self._tensor_percentile(bg_weights, 0.50)
+        raw_risk_p90 = self._tensor_percentile(bg_raw_risk, 0.90)
+        rel_risk_p90 = self._tensor_percentile(bg_rel_risk, 0.90)
+        if bg_weight_p10 is not None:
+            storage.put_scalar("subs/bg_weight_p10", float(bg_weight_p10.item()))
+        if bg_weight_p50 is not None:
+            storage.put_scalar("subs/bg_weight_p50", float(bg_weight_p50.item()))
+        if raw_risk_p90 is not None:
+            storage.put_scalar("subs/raw_risk_bg_p90", float(raw_risk_p90.item()))
+        if rel_risk_p90 is not None:
+            storage.put_scalar("subs/rel_risk_bg_p90", float(rel_risk_p90.item()))
+        suppressed_ratio = (bg_weights < 0.99).float().mean()
+        storage.put_scalar("subs/suppressed_bg_ratio", float(suppressed_ratio.item()))
+        storage.put_scalar(
+            "subs/ratio_bg_downweighted",
+            float(suppressed_ratio.item()),
+        )
+
+    def _compute_subs_cls_loss(
+        self, outputs: FastRCNNOutputs
+    ) -> Optional[torch.Tensor]:
+        if not self.subs_enabled:
+            return None
+        weights = self.latest_subs_weights
+        if weights is None or weights.numel() != outputs.gt_classes.numel():
+            return None
+        targets = outputs.gt_classes.to(
+            device=outputs.pred_class_logits.device, dtype=torch.long
+        )
+        weights = weights.to(
+            device=outputs.pred_class_logits.device,
+            dtype=outputs.pred_class_logits.dtype,
+        )
+        raw_losses = F.cross_entropy(
+            outputs.pred_class_logits, targets, ignore_index=-1, reduction="none"
+        )
+        valid = targets != -1
+        if not torch.any(valid):
+            return outputs.pred_class_logits.new_tensor(0.0)
+        weights = weights * valid.to(dtype=weights.dtype)
+        denom = weights.sum().clamp(min=1.0)
+        loss = (raw_losses * weights).sum() / denom
+        try:
+            storage = get_event_storage()
+            storage.put_scalar("subs/loss_cls", float(loss.detach().item()))
+            storage.put_scalar("subs/loss_denom", float(denom.detach().item()))
+        except Exception:
+            pass
+        return loss
+
     def _attribute_forward(
         self,
         box_features: torch.Tensor,
         outputs: FastRCNNOutputs,
         semantic_state=None,
     ):
+        self.latest_subs_weights = None
+        self.latest_subs_raw_risk = None
+        self.latest_subs_rel_risk = None
         if semantic_state is None:
             semantic_state = self._build_semantic_state(box_features)
         if semantic_state is None:
@@ -508,6 +747,7 @@ class AMBR(nn.Module):
             _,
             _,
             _,
+            *extra_state,
         ) = semantic_state
         self._log_weakly_supervised_attribute_metrics(
             attr_embeddings,
@@ -521,6 +761,17 @@ class AMBR(nn.Module):
         attr_targets = outputs.gt_classes
         if attr_targets is not None:
             attr_targets = attr_targets.clone()
+        subs_class_prototypes = class_prototypes
+        subs_dynamic_prototypes = dynamic_prototypes
+        if self._subs_current_stage() == "base" and extra_state:
+            subs_class_prototypes = extra_state[0]
+            subs_dynamic_prototypes = None
+        self._compute_subs_bg_weights(
+            attr_embeddings,
+            outputs.gt_classes,
+            subs_class_prototypes,
+            subs_dynamic_prototypes,
+        )
         penalty, attr_targets = self._apply_background_filtering(
             attr_embeddings, attr_targets, class_prototypes, outputs
         )
@@ -832,6 +1083,7 @@ class AMBR(nn.Module):
             _,
             mixed_class_prototypes,
             mixed_dynamic_prototypes,
+            *_,
         ) = semantic_state
         if self.visual_proto_enabled and self.visual_proto_mix_inference:
             class_prototypes = mixed_class_prototypes

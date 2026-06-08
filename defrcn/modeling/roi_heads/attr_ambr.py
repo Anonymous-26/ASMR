@@ -70,35 +70,21 @@ class AMBR(nn.Module):
         self.attr_cluster_loss_weight = self.attr_cfg.CLUSTER_LOSS_WEIGHT
         self.bg_threshold = self.attr_cfg.BG_THRESHOLD
         self.pseudo_threshold = self.attr_cfg.PSEUDO_THRESHOLD
-        self.bg_penalty_weight = self.attr_cfg.BG_SUPPRESSION_WEIGHT
         self.agr_cfg = self.attr_cfg.AGR
         self.agr_detector_loss_enabled = bool(self.agr_cfg.DETECTOR_LOSS_ENABLED)
+        self.agr_enabled = bool(getattr(self.agr_cfg, "ENABLED", False)) or (
+            float(self.bg_threshold) > 0.0 or float(self.pseudo_threshold) > 0.0
+            or bool(getattr(self.agr_cfg, "SOFT_REG_ENABLED", False))
+            or self.agr_detector_loss_enabled
+        )
+        self.agr_soft_q = float(getattr(self.agr_cfg, "SOFT_Q", 0.20))
+        self.agr_hard_q = float(getattr(self.agr_cfg, "HARD_Q", 0.55))
         self.agr_replace_detector_loss = bool(self.agr_cfg.REPLACE_DETECTOR_LOSS)
         self.agr_ignore_in_detector = bool(self.agr_cfg.IGNORE_IN_DETECTOR)
         self.agr_pseudo_loss_weight = float(self.agr_cfg.PSEUDO_LOSS_WEIGHT)
-        self.agr_pseudo_weight_by_confidence = bool(
-            self.agr_cfg.PSEUDO_WEIGHT_BY_CONFIDENCE
-        )
         self.agr_normalize_by_all_rois = bool(self.agr_cfg.NORMALIZE_BY_ALL_ROIS)
-        self.agr_max_pseudo_per_batch = int(self.agr_cfg.MAX_PSEUDO_PER_BATCH)
-        self.agr_visual_quality_enabled = bool(self.agr_cfg.VISUAL_QUALITY_ENABLED)
-        self.agr_max_visual_bg_prob = float(self.agr_cfg.MAX_VISUAL_BG_PROB)
-        self.agr_min_visual_novel_prob = float(self.agr_cfg.MIN_VISUAL_NOVEL_PROB)
-        self.agr_min_visual_semantic_target_prob = float(
-            self.agr_cfg.MIN_VISUAL_SEMANTIC_TARGET_PROB
-        )
-        self.agr_require_visual_semantic_agreement = bool(
-            self.agr_cfg.REQUIRE_VISUAL_SEMANTIC_AGREEMENT
-        )
-        self.agr_soft_reg_enabled = bool(self.agr_cfg.SOFT_REG_ENABLED)
         self.agr_soft_reg_weight = float(self.agr_cfg.SOFT_REG_WEIGHT)
         self.agr_soft_reg_margin = float(self.agr_cfg.SOFT_REG_MARGIN)
-        self.agr_soft_reg_weight_by_confidence = bool(
-            self.agr_cfg.SOFT_REG_WEIGHT_BY_CONFIDENCE
-        )
-        self.agr_soft_reg_suppress_hard_labels = bool(
-            self.agr_cfg.SOFT_REG_SUPPRESS_HARD_LABELS
-        )
         self.attr_warmup_iters = self.attr_cfg.WARMUP_ITERS
         self.attention_cfg = self.attr_cfg.ATTENTION
         self.attention_enabled = bool(self.attention_cfg.ENABLED)
@@ -251,8 +237,6 @@ class AMBR(nn.Module):
                 p.requires_grad = False
             print("freeze attr_cluster_projector parameters")
             
-        self.margin_threshold = self.attr_cfg.MARGIN_THRE
-        
         bg_filter_monitor_cfg = self.attr_cfg.BG_FILTER_MONITOR
         self._bg_filter_writer: Optional[SummaryWriter] = None
         self.bg_filter_monitor = None
@@ -394,13 +378,13 @@ class AMBR(nn.Module):
             return None
         state = self.latest_agr_detector_state
         if not state:
-            return None
+            return outputs.pred_class_logits.new_tensor(0.0)
         targets = state.get("targets")
         weights = state.get("weights")
         if targets is None or weights is None:
-            return None
+            return outputs.pred_class_logits.new_tensor(0.0)
         if targets.numel() != outputs.gt_classes.numel():
-            return None
+            return outputs.pred_class_logits.new_tensor(0.0)
         targets = targets.to(device=outputs.pred_class_logits.device, dtype=torch.long)
         weights = weights.to(
             device=outputs.pred_class_logits.device,
@@ -472,7 +456,7 @@ class AMBR(nn.Module):
         losses = self._compute_attribute_losses(
             attr_embeddings, attr_targets, class_prototypes, dynamic_prototypes
         )
-        if self.agr_soft_reg_enabled:
+        if self.agr_enabled:
             losses["loss_attr_agr_soft"] = (
                 self.latest_agr_soft_loss
                 if self.latest_agr_soft_loss is not None
@@ -871,12 +855,8 @@ class AMBR(nn.Module):
         outputs: Optional[FastRCNNOutputs] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         self.latest_agr_detector_state = None
-        self.latest_agr_soft_loss = (
-            attr_embeddings.new_tensor(0.0)
-            if self.agr_soft_reg_enabled
-            else None
-        )
-        if self.bg_threshold <= 0 or gt_classes is None:
+        self.latest_agr_soft_loss = None
+        if not self.agr_enabled or gt_classes is None:
             return None, gt_classes
         if not self.novel_class_indices:
             return None, gt_classes
@@ -895,7 +875,10 @@ class AMBR(nn.Module):
         novel_prototypes = class_prototypes[novel_indices]
 
         bg_embeddings = attr_embeddings[bg_mask]
-        similarities = torch.matmul(bg_embeddings, novel_prototypes.t())
+        similarities = torch.matmul(
+            F.normalize(bg_embeddings, dim=-1),
+            F.normalize(novel_prototypes, dim=-1).t(),
+        )
         topk = min(2, int(similarities.shape[1]))
         top_sims, top_idxs = torch.topk(similarities, k=topk, dim=1)
         max_sim = top_sims[:, 0]
@@ -904,139 +887,100 @@ class AMBR(nn.Module):
             margin = top_sims[:, 0] - top_sims[:, 1]
         else:
             margin = torch.zeros_like(max_sim)
-            is_discriminative = torch.ones_like(max_sim, dtype=torch.bool)
-        if topk > 1:
-            is_discriminative = margin > getattr(self, "margin_threshold", 0.1)
 
         penalty = None
-        suppress_mask = (max_sim > self.bg_threshold) & is_discriminative
-        pseudo_mask = torch.zeros_like(max_sim, dtype=torch.bool)
-        visual_bg_prob = None
-        visual_novel_prob = None
-        visual_semantic_target_prob = None
-        visual_semantic_agree = None
-        visual_quality_mask = torch.ones_like(max_sim, dtype=torch.bool)
-        semantic_pseudo_mask = pseudo_mask
         detector_targets = gt_classes.clone()
         if self.agr_replace_detector_loss:
             detector_weights = attr_embeddings.new_ones(gt_classes.shape)
         else:
             detector_weights = attr_embeddings.new_zeros(gt_classes.shape)
-        
-        if torch.any(suppress_mask):
-            suppressed = bg_indices[suppress_mask]
-            gt_classes[suppressed] = -1
-            if self.agr_replace_detector_loss or self.agr_ignore_in_detector:
-                detector_targets[suppressed] = -1
-                detector_weights[suppressed] = 0.0
-            if self.bg_penalty_weight > 0:
-                penalty = (
-                    (max_sim[suppress_mask] - self.bg_threshold)
-                    .relu()
-                    .mean()
-                    * self.bg_penalty_weight
+
+        semantic_score = self._standardized_sigmoid(max_sim)
+        margin_score = (
+            self._standardized_sigmoid(margin)
+            if topk > 1
+            else torch.ones_like(semantic_score)
+        )
+        semantic_targets = novel_indices[max_idx]
+        visual_bg_prob = None
+        visual_novel_prob = None
+        visual_semantic_target_prob = None
+        visual_semantic_agree = None
+        visual_score = torch.ones_like(semantic_score)
+        if (
+            outputs is not None
+            and outputs.pred_class_logits is not None
+            and outputs.pred_class_logits.shape[0] == gt_classes.shape[0]
+            and outputs.pred_class_logits.shape[1] > self.num_classes
+        ):
+            with torch.no_grad():
+                probs = F.softmax(outputs.pred_class_logits.detach(), dim=1)
+                bg_probs_all = probs[:, self.bg_class_index]
+                novel_probs_all = probs[:, novel_indices]
+                visual_novel_all, visual_novel_local_idx = novel_probs_all.max(dim=1)
+                visual_bg_prob = bg_probs_all[bg_indices]
+                visual_novel_prob = visual_novel_all[bg_indices]
+                visual_semantic_target_prob = probs[bg_indices, semantic_targets]
+                visual_top_novel_class = novel_indices[
+                    visual_novel_local_idx[bg_indices]
+                ]
+                visual_semantic_agree = visual_top_novel_class == semantic_targets
+                visual_score = torch.sqrt(
+                    (1.0 - visual_bg_prob).clamp(min=0.0, max=1.0)
+                    * visual_semantic_target_prob.clamp(min=0.0, max=1.0)
+                    + 1e-6
                 )
 
-        if self.pseudo_threshold > 0:
-            semantic_pseudo_mask = (max_sim > self.pseudo_threshold) & is_discriminative
-            pseudo_mask = semantic_pseudo_mask.clone()
-            if (
-                self.agr_visual_quality_enabled
-                and outputs is not None
-                and outputs.pred_class_logits is not None
-                and outputs.pred_class_logits.shape[0] == gt_classes.shape[0]
-                and outputs.pred_class_logits.shape[1] > self.num_classes
-            ):
-                with torch.no_grad():
-                    probs = F.softmax(outputs.pred_class_logits.detach(), dim=1)
-                    bg_probs_all = probs[:, self.bg_class_index]
-                    novel_probs_all = probs[:, novel_indices]
-                    visual_novel_prob, visual_novel_local_idx = novel_probs_all.max(
-                        dim=1
-                    )
-                    visual_bg_prob = bg_probs_all[bg_indices]
-                    visual_novel_prob = visual_novel_prob[bg_indices]
-                    semantic_targets = novel_indices[max_idx]
-                    visual_semantic_target_prob = probs[
-                        bg_indices, semantic_targets
-                    ]
-                    visual_top_novel_class = novel_indices[
-                        visual_novel_local_idx[bg_indices]
-                    ]
-                    visual_semantic_agree = visual_top_novel_class == semantic_targets
+        quality = (semantic_score * margin_score * visual_score).clamp(0.0, 1.0)
+        soft_q = min(max(self.agr_soft_q, 0.0), 1.0)
+        hard_q = min(max(self.agr_hard_q, soft_q), 1.0)
+        soft_mask = quality >= soft_q
+        hard_mask = quality >= hard_q
 
-                    if 0.0 < self.agr_max_visual_bg_prob < 1.0:
-                        visual_quality_mask = visual_quality_mask & (
-                            visual_bg_prob < self.agr_max_visual_bg_prob
-                        )
-                    if self.agr_min_visual_novel_prob > 0.0:
-                        visual_quality_mask = visual_quality_mask & (
-                            visual_novel_prob > self.agr_min_visual_novel_prob
-                        )
-                    if self.agr_min_visual_semantic_target_prob > 0.0:
-                        visual_quality_mask = visual_quality_mask & (
-                            visual_semantic_target_prob
-                            > self.agr_min_visual_semantic_target_prob
-                        )
-                    if self.agr_require_visual_semantic_agreement:
-                        visual_quality_mask = visual_quality_mask & visual_semantic_agree
-                pseudo_mask = pseudo_mask & visual_quality_mask
-            else:
-                semantic_pseudo_mask = pseudo_mask
-            max_pseudo = max(self.agr_max_pseudo_per_batch, 0)
-            if max_pseudo > 0 and int(pseudo_mask.sum().item()) > max_pseudo:
-                pseudo_scores = max_sim.masked_fill(~pseudo_mask, float("-inf"))
-                selected = torch.topk(
-                    pseudo_scores, k=max_pseudo, dim=0
-                ).indices
-                capped_mask = torch.zeros_like(pseudo_mask)
-                capped_mask[selected] = True
-                pseudo_mask = capped_mask
-            if torch.any(pseudo_mask):
-                pseudo = bg_indices[pseudo_mask]
-                pseudo_targets = novel_indices[max_idx[pseudo_mask]]
-                if self.agr_soft_reg_enabled:
-                    self.latest_agr_soft_loss = self._compute_agr_soft_regularization(
-                        bg_embeddings=bg_embeddings,
-                        pseudo_mask=pseudo_mask,
-                        pseudo_targets=pseudo_targets,
-                        novel_indices=novel_indices,
-                        novel_prototypes=novel_prototypes,
-                        max_sim=max_sim,
-                    )
-                    if self.agr_soft_reg_suppress_hard_labels:
-                        gt_classes[pseudo] = -1
-                else:
-                    gt_classes[pseudo] = pseudo_targets
-                    detector_targets[pseudo] = pseudo_targets
-                    if self.agr_pseudo_weight_by_confidence:
-                        pseudo_weights = (
-                            (max_sim[pseudo_mask] - self.pseudo_threshold)
-                            / max(1.0 - self.pseudo_threshold, 1e-6)
-                        ).clamp(min=0.0, max=1.0)
-                        detector_weights[pseudo] = (
-                            pseudo_weights * self.agr_pseudo_loss_weight
-                        )
-                    else:
-                        detector_weights[pseudo] = self.agr_pseudo_loss_weight
+        if torch.any(soft_mask):
+            soft_indices = bg_indices[soft_mask]
+            gt_classes[soft_indices] = -1
+            if self.agr_ignore_in_detector:
+                detector_targets[soft_indices] = -1
+                detector_weights[soft_indices] = 0.0
+            self.latest_agr_soft_loss = self._compute_agr_soft_regularization(
+                bg_embeddings=bg_embeddings,
+                soft_mask=soft_mask,
+                pseudo_targets=semantic_targets[soft_mask],
+                novel_indices=novel_indices,
+                novel_prototypes=novel_prototypes,
+                quality=quality,
+            )
+
+        if torch.any(hard_mask):
+            hard_indices = bg_indices[hard_mask]
+            hard_targets = semantic_targets[hard_mask]
+            gt_classes[hard_indices] = hard_targets
+            detector_targets[hard_indices] = hard_targets
+            detector_weights[hard_indices] = (
+                quality[hard_mask] * self.agr_pseudo_loss_weight
+            )
 
         pseudo_weight_mean = 0.0
-        if torch.any(pseudo_mask):
-            pseudo_indices = bg_indices[pseudo_mask]
+        if torch.any(hard_mask):
+            pseudo_indices = bg_indices[hard_mask]
             pseudo_weight_mean = float(
                 detector_weights[pseudo_indices].detach().mean().item()
             )
         self.latest_agr_detector_state = {
             "targets": detector_targets.detach(),
             "weights": detector_weights.detach(),
-            "num_ignored": int((suppress_mask & (~pseudo_mask)).sum().item()),
-            "num_pseudo": int(pseudo_mask.sum().item()),
+            "num_ignored": int((soft_mask & (~hard_mask)).sum().item()),
+            "num_pseudo": int(hard_mask.sum().item()),
             "pseudo_weight_mean": pseudo_weight_mean,
         }
         self._log_agr_quality_stats(
-            semantic_pseudo_mask=semantic_pseudo_mask,
-            pseudo_mask=pseudo_mask,
-            visual_quality_mask=visual_quality_mask,
+            quality=quality,
+            semantic_score=semantic_score,
+            margin_score=margin_score,
+            visual_score=visual_score,
+            soft_mask=soft_mask,
+            hard_mask=hard_mask,
             visual_bg_prob=visual_bg_prob,
             visual_novel_prob=visual_novel_prob,
             visual_semantic_target_prob=visual_semantic_target_prob,
@@ -1051,28 +995,35 @@ class AMBR(nn.Module):
             max_sim=max_sim,
             max_idx=max_idx,
             margin=margin,
-            suppress_mask=suppress_mask,
-            pseudo_mask=pseudo_mask,
+            suppress_mask=soft_mask,
+            pseudo_mask=hard_mask,
         )
         return penalty, gt_classes
+
+    @staticmethod
+    def _standardized_sigmoid(values: torch.Tensor) -> torch.Tensor:
+        if values.numel() <= 1:
+            return torch.full_like(values, 0.5)
+        mean = values.mean()
+        std = values.std(unbiased=False).clamp(min=1e-6)
+        return torch.sigmoid((values - mean) / std)
 
     def _compute_agr_soft_regularization(
         self,
         *,
         bg_embeddings: torch.Tensor,
-        pseudo_mask: torch.Tensor,
+        soft_mask: torch.Tensor,
         pseudo_targets: torch.Tensor,
         novel_indices: torch.Tensor,
         novel_prototypes: torch.Tensor,
-        max_sim: torch.Tensor,
+        quality: torch.Tensor,
     ) -> torch.Tensor:
         if (
-            not self.agr_soft_reg_enabled
-            or self.agr_soft_reg_weight <= 0
-            or not torch.any(pseudo_mask)
+            self.agr_soft_reg_weight <= 0
+            or not torch.any(soft_mask)
         ):
             return bg_embeddings.new_tensor(0.0)
-        preds = bg_embeddings[pseudo_mask]
+        preds = bg_embeddings[soft_mask]
         target_local = (pseudo_targets[:, None] == novel_indices[None, :]).float().argmax(dim=1)
         target_prototypes = novel_prototypes[target_local]
         pos_loss = 1.0 - F.cosine_similarity(preds, target_prototypes, dim=-1)
@@ -1089,21 +1040,19 @@ class AMBR(nn.Module):
             self.agr_soft_reg_margin + hard_neg - pos_sims
         ).clamp(min=0.0)
         loss = pos_loss + margin_loss
-        if self.agr_soft_reg_weight_by_confidence:
-            weights = (
-                (max_sim[pseudo_mask] - self.pseudo_threshold)
-                / max(1.0 - self.pseudo_threshold, 1e-6)
-            ).clamp(min=0.0, max=1.0)
-            loss = loss * weights
-            denom = weights.sum().clamp(min=1.0)
-            loss = loss.sum() / denom
-        else:
-            loss = loss.mean()
+        weights = quality[soft_mask].detach().clamp(min=0.0, max=1.0)
+        loss = loss * weights
+        denom = weights.sum().clamp(min=1.0)
+        loss = loss.sum() / denom
         loss = loss * self.agr_soft_reg_weight
         try:
             storage = get_event_storage()
             storage.put_scalar("agr_soft/loss", float(loss.detach().item()))
-            storage.put_scalar("agr_soft/num_rois", float(pseudo_mask.sum().item()))
+            storage.put_scalar("agr_soft/num_rois", float(soft_mask.sum().item()))
+            storage.put_scalar(
+                "agr_soft/quality_mean",
+                float(weights.mean().item()) if weights.numel() else 0.0,
+            )
         except Exception:
             pass
         return loss
@@ -1111,9 +1060,12 @@ class AMBR(nn.Module):
     def _log_agr_quality_stats(
         self,
         *,
-        semantic_pseudo_mask: torch.Tensor,
-        pseudo_mask: torch.Tensor,
-        visual_quality_mask: torch.Tensor,
+        quality: torch.Tensor,
+        semantic_score: torch.Tensor,
+        margin_score: torch.Tensor,
+        visual_score: torch.Tensor,
+        soft_mask: torch.Tensor,
+        hard_mask: torch.Tensor,
         visual_bg_prob: Optional[torch.Tensor],
         visual_novel_prob: Optional[torch.Tensor],
         visual_semantic_target_prob: Optional[torch.Tensor],
@@ -1121,24 +1073,25 @@ class AMBR(nn.Module):
     ) -> None:
         try:
             storage = get_event_storage()
-            semantic_count = int(semantic_pseudo_mask.sum().item())
-            final_count = int(pseudo_mask.sum().item())
+            storage.put_scalar("agr_v2/quality_mean", float(quality.mean().item()))
+            storage.put_scalar("agr_v2/quality_max", float(quality.max().item()))
             storage.put_scalar(
-                "agr_quality/num_semantic_pseudo_raw", float(semantic_count)
+                "agr_v2/semantic_score_mean", float(semantic_score.mean().item())
             )
-            storage.put_scalar("agr_quality/num_pseudo_final", float(final_count))
             storage.put_scalar(
-                "agr_quality/num_rejected_by_visual",
-                float(max(semantic_count - final_count, 0)),
+                "agr_v2/margin_score_mean", float(margin_score.mean().item())
             )
+            storage.put_scalar(
+                "agr_v2/visual_score_mean", float(visual_score.mean().item())
+            )
+            storage.put_scalar("agr_v2/num_soft", float(soft_mask.sum().item()))
+            storage.put_scalar("agr_v2/num_hard", float(hard_mask.sum().item()))
+            storage.put_scalar(
+                "agr_quality/num_semantic_pseudo_raw", float(soft_mask.sum().item())
+            )
+            storage.put_scalar("agr_quality/num_pseudo_final", float(hard_mask.sum().item()))
             if visual_bg_prob is None:
                 return
-            if semantic_count > 0:
-                rejected = semantic_pseudo_mask & (~visual_quality_mask)
-                storage.put_scalar(
-                    "agr_quality/visual_reject_ratio",
-                    float(rejected.sum().item()) / float(max(semantic_count, 1)),
-                )
             storage.put_scalar(
                 "agr_quality/visual_bg_prob_mean",
                 float(visual_bg_prob.detach().mean().item()),
